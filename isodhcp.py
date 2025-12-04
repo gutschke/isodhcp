@@ -3,6 +3,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import struct
@@ -28,7 +29,8 @@ class LeaseManager:
         self.lock = threading.Lock()
 
         # In-memory storage
-        self.leases = {}     # MAC -> {'ip': str, 'expires': float}
+        self.leases = {}     # MAC -> {'ip': str, 'expires': float,
+                             #         'hostname': str (opt) }
         self.ip_to_mac = {}  # IP -> MAC
 
         # Calculate Free IPs
@@ -170,6 +172,52 @@ class LeaseManager:
 
         return expired_entries
 
+class RateLimiter:
+    def __init__(self, rate=1.0, burst=5):
+        self.rate = rate          # Tokens added per second
+        self.burst = burst        # Maximum bucket size
+        self.clients = {}         # MAC -> {tokens: float, last_update: float}
+        self.lock = threading.Lock()
+
+    def is_allowed(self, mac):
+        now = time.time()
+
+        with self.lock:
+            # Initialize new client
+            if mac not in self.clients:
+                self.clients[mac] = {
+                    'tokens': self.burst - 1,
+                    'last_update': now
+                }
+                return True
+
+            client = self.clients[mac]
+            elapsed = now - client['last_update']
+            client['last_update'] = now
+            client['tokens'] = min(self.burst,
+                                   client['tokens'] + (elapsed * self.rate))
+            if client['tokens'] >= 1.0:
+                client['tokens'] -= 1.0
+                return True
+            else:
+                return False
+
+    def cleanup(self):
+        """Periodically remove old clients to save RAM"""
+        now = time.time()
+        with self.lock:
+            # Remove clients we haven't seen in 1 hour
+            stale_macs = [
+                mac for mac,
+                data in self.clients.items()
+                if (now - data['last_update']) > 3600
+            ]
+            for mac in stale_macs:
+                del self.clients[mac]
+            if stale_macs:
+                logging.debug(f"🧹 RateLimiter cleaned up {len(stale_macs)} "
+                              f"stale MACs")
+
 class UnnumberedDHCPServer:
     def __init__(self, interface, server_ip=None, pool_cidr=None,
                  dns_server=None, lease_time=LEASE_TIME,
@@ -177,6 +225,7 @@ class UnnumberedDHCPServer:
         self.iface = interface
         self.lease_time = lease_time
         self.lease_file = lease_file
+        self.limiter = RateLimiter(rate=2.0, burst=5)
 
         # Detect IP/Pool
         if not server_ip or not pool_cidr:
@@ -295,6 +344,7 @@ class UnnumberedDHCPServer:
                 logger.info(f"⏳ Lease expired for {mac}, IPv4 {ip}. "
                             f"Cleaning up.")
                 self.delete_host_route(ip)
+            self.limiter.cleanup()
 
     def get_client_requested_ip(self, pkt):
         """Combined logic to find what IP the client is talking about"""
@@ -341,60 +391,74 @@ class UnnumberedDHCPServer:
         return clean_name if clean_name else None
 
     def handle_dhcp(self, pkt):
-        if not (DHCP in pkt and pkt[DHCP].options):
+        try:
+            if not (DHCP in pkt and pkt[DHCP].options):
+                return
+
+            # Uncomment to debug DHCP protocol.
+            # logger.info(pkt.show(dump=True))
+
+            dhcp_opts = {
+                opt[0]: opt[1]
+                for opt in pkt[DHCP].options if isinstance(opt, tuple)
+            }
+            msg_type = dhcp_opts.get("message-type")
+            hostname = self.get_hostname(dhcp_opts)
+            client_mac = pkt[Ether].src.lower()
+            xid = pkt[BOOTP].xid
+
+            if not re.match(r"[0-9a-f]{2}([:][0-9a-f]{2}){5}$", client_mac):
+                logger.warning(f"⚠️ Ignoring packet with invalid MAC: "
+                               f"{client_mac}")
+                return
+
+            # Rate limit traffic per MAC address
+            if not self.limiter.is_allowed(client_mac):
+                return
+
+            # DISCOVER (Client needs an IP) ---
+            if msg_type == 1:
+                assigned_ip = self.lease_mgr.allocate_or_renew(client_mac,
+                                                               hostname)
+                if assigned_ip:
+                    self.send_reply(pkt, "offer", assigned_ip, xid, client_mac)
+
+            # REQUEST (Client accepts offer or renews) ---
+            elif msg_type == 3:
+                req_ip = self.get_client_requested_ip(pkt)
+
+                # Security Check: Did we actually assign this IP to this MAC?
+                # We peek into the lease manager without changing state yet
+                current_owner_mac = self.lease_mgr.ip_to_mac.get(req_ip)
+
+                # Case A: It's a valid request for an IP we reserved for them
+                if current_owner_mac == client_mac:
+                    # Confirm allocation (updates timestamp)
+                    final_ip = self.lease_mgr.allocate_or_renew(client_mac,
+                                                                hostname)
+
+                    # Setup Networking
+                    self.inject_host_route(final_ip)
+                    self.send_reply(pkt, "ack", final_ip, xid, client_mac)
+
+                # Case B: They are asking for an IP requesting someone else's
+                # IP or garbage
+                else:
+                    logger.warning(f"NAK: {client_mac} requested {req_ip} but "
+                                   f"it belongs to {current_owner_mac}")
+                    self.send_reply(pkt, "nak", req_ip, xid, client_mac)
+
+            # RELEASE (Client is shutting down politely) ---
+            elif msg_type == 7:
+                 req_ip = pkt[BOOTP].ciaddr
+                 # Only allow release if the IP actually belongs to them
+                 if self.lease_mgr.ip_to_mac.get(req_ip) == client_mac:
+                     released_ip = self.lease_mgr.release(client_mac)
+                     if released_ip:
+                         self.delete_host_route(released_ip)
+        except Exception as e:
+            logger.error(f"⚠️ Malformed packet caused crash: {e}")
             return
-
-        # Uncomment to debug DHCP protocol.
-        # logger.info(pkt.show(dump=True))
-
-        dhcp_opts = {
-            opt[0]: opt[1]
-            for opt in pkt[DHCP].options if isinstance(opt, tuple)
-        }
-        msg_type = dhcp_opts.get("message-type")
-        hostname = self.get_hostname(dhcp_opts)
-        client_mac = pkt[Ether].src
-        xid = pkt[BOOTP].xid
-
-        # DISCOVER (Client needs an IP) ---
-        if msg_type == 1:
-            assigned_ip = self.lease_mgr.allocate_or_renew(client_mac, hostname)
-            if assigned_ip:
-                self.send_reply(pkt, "offer", assigned_ip, xid, client_mac)
-
-        # REQUEST (Client accepts offer or renews) ---
-        elif msg_type == 3:
-            req_ip = self.get_client_requested_ip(pkt)
-
-            # Security Check: Did we actually assign this IP to this MAC?
-            # We peek into the lease manager without changing state yet
-            current_owner_mac = self.lease_mgr.ip_to_mac.get(req_ip)
-
-            # Case A: It's a valid request for an IP we reserved for them
-            if current_owner_mac == client_mac:
-                # Confirm allocation (updates timestamp)
-                final_ip = self.lease_mgr.allocate_or_renew(client_mac,
-                                                            hostname)
-
-                # Setup Networking
-                self.inject_host_route(final_ip)
-                self.send_reply(pkt, "ack", final_ip, xid, client_mac)
-
-            # Case B: They are asking for an IP requesting someone else's
-            # IP or garbage
-            else:
-                logger.warning(f"NAK: {client_mac} requested {req_ip} but "
-                               f"it belongs to {current_owner_mac}")
-                self.send_reply(pkt, "nak", req_ip, xid, client_mac)
-
-        # RELEASE (Client is shutting down politely) ---
-        elif msg_type == 7:
-             req_ip = pkt[BOOTP].ciaddr
-             # Only allow release if the IP actually belongs to them
-             if self.lease_mgr.ip_to_mac.get(req_ip) == client_mac:
-                 released_ip = self.lease_mgr.release(client_mac)
-                 if released_ip:
-                     self.delete_host_route(released_ip)
 
     def build_option_121(self, gateway_ip):
         """
