@@ -6,7 +6,7 @@ server that only ever hands out Point-To-Point host routes for all
 clients.
 
 This forces network traffic through the router's networking stack
-avoiding the level 2 network switch, and you can then use normal
+avoiding the layer 2 network switch, and you can then use normal
 firewall rules to make traffic decisions.
 
 The daemon doesn't have any configuration file and is configured
