@@ -608,8 +608,8 @@ class UnnumberedDHCPServer:
                         vendor_id = str(vendor_id_bytes)
 
                     # Check partial matches
-                    for pattern.lower() in self.compat_vendors:
-                        if pattern in vendor_id:
+                    for pattern in self.compat_vendors:
+                        if pattern.lower() in vendor_id:
                             logger.info(f"⚠️ Legacy Mode: Vendor match "
                                         f"for {client_mac} ('{vendor_id}')")
                             return True
