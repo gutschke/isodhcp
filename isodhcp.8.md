@@ -29,39 +29,40 @@ While the server defaults to strict isolation (/32 masks), it includes a **Compa
 # Options
 
 
-* **-d**_ dns_**, --dns **_dns_  
+* **-d** _dns_, **--dns** _dns_  
   The DNS server IP address to offer clients. If omitted, the server parses _/etc/resolv.conf_ (and systemd-resolved upstream configurations) to find a valid IPv4 nameserver.
   
-* **-f**_ path_**, --lease-file **_path_  
+* **-f** _path_, **--lease-file** _path_  
   Path to the JSON file where lease state is persisted. Defaults to _dhcp\_leases.json_ in the current working directory. The server writes to this file on allocation, release, and shutdown. To minimize disk wear, renewals are only written if the expiration time changes significantly.
   
-* **-i**_ interface_**, --interface **_interface_  
+* **-i** _interface_, **--interface** _interface_  
   The network interface to listen on (e.g., _eth1_, _wlan0_). The server binds specifically to this interface to avoid conflicts with other DHCP servers on the host. Defaults to _guest_.
   
-* **-p**_ pool_**, --pool **_pool_  
+* **-p** _pool_, **--pool** _pool_  
   The CIDR range of IPs to allocate (e.g., _10.100.0.0/24_). If omitted, the server attempts to auto-detect the subnet configured on the interface.
   
-* **-s**_ server_ip_**, --server-ip **_server_ip_  
+* **-s** _server_ip_, **--server-ip** _server_ip_  
   The IP address of the router (gateway). If omitted, the server attempts to auto-detect the primary IP address assigned to the interface specified by **-i**.
   
-* **-t**_ seconds_**, --lease-time **_seconds_  
+* **-t** _seconds_, **--lease-time** _seconds_  
   The duration of the DHCP lease in seconds. Defaults to _3600_ (1 hour).
-* **--compat-mac**_ mac_  
+
+* **--compat-mac** _mac_  
   Treat the specified MAC address as a "legacy" client. Instead of receiving the standard strict **/32** netmask (client isolation), this device will receive the actual CIDR netmask of the pool (e.g., **255.255.255.0**).  
   Useful for older printers, embedded devices, or game consoles that refuse to accept a gateway outside of their own subnet mask.  
   Example: _--compat-mac 00:11:22:33:44:55_
   
-* **--compat-oui**_ oui_  
+* **--compat-oui** _oui_  
   Treat any device whose MAC address starts with this 3-byte prefix (Organizationally Unique Identifier) as a legacy client.  
   The OUI format is _AA:BB:CC_. Case is insensitive.  
   Example: _--compat-oui B8:27:EB_ (Raspberry Pi Foundation)
   
-* **--compat-vendor**_ string_  
+* **--compat-vendor** _string_  
   Treat any device sending a DHCP Vendor Class Identifier (option 60) containing this substring as a legacy client.  
   Useful for broad classes of devices or operating systems known to struggle with unnumbered interfaces.  
   Example: _--compat-vendor "MSFT 5.0"_
   
-* **--static**_ mac=ip_  
+* **--static** _mac=ip_  
   Maps a specific MAC address to a fixed IP. This option can be repeated multiple times.  
   Format: _aa:bb:cc:dd:ee:ff=192.168.1.50{,hostname}_.  
   Static IPs are removed from the dynamic pool at startup. If a conflict exists in the persistent lease file, the static mapping takes precedence.
