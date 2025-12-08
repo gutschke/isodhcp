@@ -1,0 +1,157 @@
+.TH ISODHCP 8 "December 2025" "Linux" "System Administration"
+.SH NAME
+isodhcp \- Unnumbered DHCP Server with Client Isolation
+.SH SYNOPSIS
+.B isodhcp
+[\fB\-d\fR \fIdns_server\fR]
+[\fB\-f\fR \fIlease_file\fR]
+[\fB\-i\fR \fIinterface\fR]
+[\fB\-p\fR \fIpool_cidr\fR]
+[\fB\-s\fR \fIserver_ip\fR]
+[\fB\-t\fR \fIlease_time\fR]
+[\fB\-\-compat\-mac\fR \fImac\fR]
+[\fB\-\-compat\-oui\fR \fIoui\fR]
+[\fB\-\-compat\-vendor\fR \fIstring\fR]
+[\fB\-\-static\fR \fImac=ip{,hostname}\fR]...
+.SH DESCRIPTION
+.B isodhcp
+is a lightweight, specialized DHCP server designed for Linux routers hosting Guest, IoT, or untrusted networks.
+
+Unlike standard DHCP servers, \fBisodhcp\fR utilizes an "Unnumbered
+Interface" architecture. It assigns clients a \fB/32\fR subnet mask
+(255.255.255.255), forcing all traffic \- even traffic destined for
+other devices on the same physical wire \- to route through the gateway.
+
+Simultaneously, \fBisodhcp\fR interacts directly with the Linux kernel using Netlink to inject explicit host routes for every connected client. This combination allows the administrator to implement strict Layer 3 Client Isolation and granular firewalling (via nftables) on the router, effectively treating a shared Ethernet segment as a collection of point-to-point links.
+
+The daemon uses raw sockets (via Scapy) to handle DHCP traffic, bypassing standard UDP listeners. It includes built-in rate limiting to prevent DoS attacks and manages lease persistence via a JSON file.
+
+While the server defaults to strict isolation (/32 masks), it includes a \fBCompatibility Mode\fR to dynamically provide standard netmasks (e.g., /24) to specific legacy clients identified by MAC address, OUI prefix, or Vendor ID.
+.SH OPTIONS
+.TP
+.BI \-d " dns" ", \-\-dns " dns
+The DNS server IP address to offer clients. If omitted, the server parses \fI/etc/resolv.conf\fR (and systemd-resolved upstream configurations) to find a valid IPv4 nameserver.
+
+.TP
+.BI \-f " path" ", \-\-lease-file " path
+Path to the JSON file where lease state is persisted. Defaults to \fIdhcp_leases.json\fR in the current working directory. The server writes to this file on allocation, release, and shutdown. To minimize disk wear, renewals are only written if the expiration time changes significantly.
+
+.TP
+.BI \-i " interface" ", \-\-interface " interface
+The network interface to listen on (e.g., \fIeth1\fR, \fIwlan0\fR). The server binds specifically to this interface to avoid conflicts with other DHCP servers on the host. Defaults to \fIguest\fR.
+
+.TP
+.BI \-p " pool" ", \-\-pool " pool
+The CIDR range of IPs to allocate (e.g., \fI10.100.0.0/24\fR). If omitted, the server attempts to auto-detect the subnet configured on the interface.
+
+.TP
+.BI \-s " server_ip" ", \-\-server-ip " server_ip
+The IP address of the router (gateway). If omitted, the server attempts to auto-detect the primary IP address assigned to the interface specified by \fB\-i\fR.
+
+.TP
+.BI \-t " seconds" ", \-\-lease-time " seconds
+The duration of the DHCP lease in seconds. Defaults to \fI3600\fR (1 hour).
+.TP
+.BI \-\-compat\-mac " mac"
+Treat the specified MAC address as a "legacy" client. Instead of receiving the standard strict \fB/32\fR netmask (client isolation), this device will receive the actual CIDR netmask of the pool (e.g., \fB255.255.255.0\fR).
+.br
+Useful for older printers, embedded devices, or game consoles that refuse to accept a gateway outside of their own subnet mask.
+.br
+Example: \fI\-\-compat\-mac 00:11:22:33:44:55\fR
+
+.TP
+.BI \-\-compat\-oui " oui"
+Treat any device whose MAC address starts with this 3-byte prefix (Organizationally Unique Identifier) as a legacy client.
+.br
+The OUI format is \fIAA:BB:CC\fR. Case is insensitive.
+.br
+Example: \fI\-\-compat\-oui B8:27:EB\fR (Raspberry Pi Foundation)
+
+.TP
+.BI \-\-compat\-vendor " string"
+Treat any device sending a DHCP Vendor Class Identifier (option 60) containing this substring as a legacy client.
+.br
+Useful for broad classes of devices or operating systems known to struggle with unnumbered interfaces.
+.br
+Example: \fI\-\-compat\-vendor "MSFT 5.0"\fR
+
+.TP
+.BI \-\-static " mac=ip"
+Maps a specific MAC address to a fixed IP. This option can be repeated multiple times.
+.br
+Format: \fIaa:bb:cc:dd:ee:ff=192.168.1.50{,hostname}\fR.
+.br
+Static IPs are removed from the dynamic pool at startup. If a conflict exists in the persistent lease file, the static mapping takes precedence.
+
+.SH SIGNALS
+.TP
+.B SIGINT, SIGTERM
+The server catches these signals to perform an orderly shutdown. It flushes the current state of all leases to the JSON file before exiting.
+
+.SH EXAMPLES
+.PP
+\fB1. Auto-detected configuration (Standard Usage)\fP
+.br
+Start the server on \fIguest0\fR. The server IP and Pool are derived from the interface's system configuration:
+.IP
+.B isodhcp \-i guest0
+
+.PP
+\fB2. Manual Override with Static IPs\fP
+.br
+Manually specify the gateway and pool, and assign a static IP to a printer:
+.IP
+.B isodhcp \-i eth1 \-s 192.168.50.1 \-p 192.168.50.0/24 \-\-static 00:11:22:33:44:55=192.168.50.10,laserprinter
+
+.PP
+\fB3. High-Turnover Guest Network\fP
+.br
+Set a short lease time (5 minutes) for a busy public Wi-Fi interface:
+.IP
+.B isodhcp \-i wlan0 \-\-lease-time 300
+
+.PP
+\fB4. Systemd Service Definition\fP
+.br
+A typical \fIExecStart\fR line in a systemd unit file:
+.IP
+.B ExecStart=/usr/bin/python3 /opt/isodhcp/server.py \-\-interface eth1 \-\-lease-file /opt/isodhcp/leases.json
+
+.PP
+\fB5. Handling Legacy Devices\fP
+.br
+Run the server while relaxing isolation for a specific printer, all Raspberry Pis, and old Windows clients:
+.IP
+.B isodhcp \-i eth1 \-\-compat\-mac 00:11:22:33:44:55 \-\-compat\-oui B8:27:EB \-\-compat\-vendor "MSFT 5.0"
+
+.SH FILES
+.TP
+.I ./dhcp_leases.json
+The default location for lease persistence. Ensure the user running the daemon has write permissions to this file (or directory).
+
+.SH SECURITY & PERMISSIONS
+To run \fBisodhcp\fR as an unprivileged user, the process requires the following Linux Capabilities:
+.TP
+.B CAP_NET_RAW
+Required to open raw sockets for sending/receiving DHCP packets via Scapy.
+.TP
+.B CAP_NET_ADMIN
+Required to modify the kernel routing table (adding/removing /32 routes via Netlink).
+.TP
+.B CAP_NET_BIND_SERVICE
+Required to bind to port 67 (optional, depending on implementation details, but recommended).
+
+.PP
+In a systemd unit file, these can be assigned via:
+.br
+\fIAmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE\fR
+
+.SH AVAHI / MDNS INTERACTION
+By default, this server disables \fBPromiscuous Mode\fR on the raw socket to prevent the OS from flagging a "Link Change" event. This prevents local mDNS daemons (like Avahi) from flushing their cache every time the server restarts.
+
+To ensure proper mDNS reflection between the isolated network and a trusted network, ensure the router interface has a valid IP address within the pool range (e.g., \fI10.100.0.1/24\fR), even though clients are assigned \fI/32\fR masks.
+
+.SH SEE ALSO
+.BR ip (8),
+.BR nftables (8),
+.BR avahi-daemon (8)
