@@ -20,13 +20,22 @@ LEASE_TIME = 3600
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- SCAPY CONFIGURATION ---
+# 0 = Do not set interface to promiscuous mode (prevents Avahi flapping)
+conf.sniff_promisc = 0
+
 class LeaseManager:
-    def __init__(self, pool_cidr, server_ip, lease_file, lease_time):
+    def __init__(self, pool_cidr, server_ip, lease_file, lease_time, static_map=None):
         self.network = ipaddress.IPv4Network(pool_cidr)
         self.server_ip = ipaddress.IPv4Address(server_ip)
         self.lease_file = lease_file
         self.lease_time = lease_time
         self.lock = threading.Lock()
+
+        # Filter the map before we do anything else
+        # {mac: (ip, hostname)}
+        self.static_map = self.sanitize_static_map(static_map) \
+            if static_map else {}
 
         # In-memory storage
         self.leases = {}     # MAC -> {'ip': str, 'expires': float,
@@ -41,8 +50,124 @@ class LeaseManager:
 
         self.free_ips = self.all_possible_ips.copy()
 
-        # Load from disk immediately
+        # Reserve static ips (only reserve the ones that passed sanitization).
+        # Remove them from the free pool so random clients don't get them.
+        for mac, (ip, hostname) in self.static_map.items():
+            h = f'"{hostname}" ' if hostname else ''
+            if ip in self.free_ips:
+                self.free_ips.remove(ip)
+                logger.info(f"📌 Reserved Static IP: {ip} for {h}{mac}")
+            else:
+                # This happens if the IP is valid but already taken (unlikely
+                # on boot) or if logic failed.
+                logger.warning(f"⚠️ Could not reserve {ip} for {h}{mac}"
+                               f"(Not in free pool?)")
+
+        # Load from disk
         self.load_leases()
+
+        # Resolve conflicts
+        # Ensure loaded disk state doesn't contradict our command
+        # line static map
+        self.enforce_static_bindings()
+
+    def sanitize_static_map(self, raw_map):
+        """
+        Validates static IPs against the network topology.
+        Returns a clean dictionary containing only valid mappings.
+        """
+        valid_map = {}
+        seen_ips = set()
+
+        for mac, (ip_str, hostname) in raw_map.items():
+            h = f'"{hostname}" ' if hostname else ''
+            try:
+                ip_obj = ipaddress.IPv4Address(ip_str)
+
+                # Is it actually in our subnet?
+                if ip_obj not in self.network:
+                    logger.error(f"❌ Static IP {ip_str} (for {h}{mac}) is "
+                                 f"outside the pool {self.network}. Ignoring.")
+                    continue
+
+                # Is it the Gateway?
+                if ip_obj == self.server_ip:
+                    logger.error(f"❌ Static IP {ip_str} (for {h}{mac}) "
+                                 f"conflicts with gateway/server IP. "
+                                 f"Ignoring.")
+                    continue
+
+                # Is it Network or Broadcast address?
+                # (Note: .hosts() usually excludes these, but manual checks
+                # are safer)
+                if ip_obj == self.network.network_address:
+                    logger.error(f"❌ Static IP {ip_str} (for {h}{mac}) is "
+                                 f"the network address. Ignoring.")
+                    continue
+                if ip_obj == self.network.broadcast_address:
+                    logger.error(f"❌ Static IP {ip_str} (for {h}{mac}) is "
+                                 f"the broadcast address. Ignoring.")
+                    continue
+
+                # Is this IP already assigned to another static MAC?
+                # (User might have passed --static mac1=ipA --static mac2=ipA)
+                if ip_str in seen_ips:
+                    logger.error(f"❌ Static IP {ip_str} (for {h}{mac}) is "
+                                 f"assigned to multiple MACs. Ignoring {mac}.")
+                    continue
+
+                # If we get here, it's valid.
+                seen_ips.add(ip_str)
+                valid_map[mac] = (ip_str, hostname)
+
+            except ValueError:
+                logger.error(f"❌ Invalid IP format in static map: {ip_str}")
+            except Exception as e:
+                logger.error(f"❌ Unexpected error validating {ip_str}: {e}")
+
+        if len(valid_map) < len(raw_map):
+            logger.warning(f"⚠️  Loaded {len(valid_map)} static mappings "
+                           f"(dropped {len(raw_map) - len(valid_map)} "
+                           f"invalid entries).")
+        return valid_map
+
+    def enforce_static_bindings(self):
+        """
+        Cleans up the loaded state to ensure static mappings take precedence.
+        """
+        leases_to_purge = []
+
+        for mac, data in self.leases.items():
+            lease_ip = data['ip']
+
+            # Conflict: This MAC is static, but has a different dynamic IP
+            if mac in self.static_map:
+                target_ip, hostname = self.static_map[mac]
+                if lease_ip != target_ip:
+                    h = f'"{hostname}" ' if hostname else ''
+                    logger.warning(f"⚠️ Conflict: Static client {h}{mac} has "
+                                   f"wrong dynamic IP {lease_ip}. Purging.")
+                    leases_to_purge.append(mac)
+                    # Note: We don't add lease_ip back to free_ips here if
+                    # it's supposed to be static for someone else. Logic
+                    # below handles that.
+
+            # Conflict: This IP is static (for someone else), but assigned
+            # to this MAC. Check if lease_ip is a value in static_map (but
+            # not for this mac)
+            for static_mac, (static_ip, hostname) in self.static_map.items():
+                h = f'"{hostname}" ' if hostname else ''
+                if lease_ip == static_ip and mac != static_mac:
+                    logger.warning(f"⚠️ Conflict: IP {lease_ip} is reserved "
+                                   f"for {h}{static_mac} but held by {mac}. "
+                                   f"Purging.")
+                    leases_to_purge.append(mac)
+                    break
+
+        # Execute purge
+        for mac in set(leases_to_purge):
+            # This removes from self.leases and self.ip_to_mac
+            self.release(mac)
 
     def load_leases(self):
         """Loads leases from disk and filters out expired ones."""
@@ -90,13 +215,42 @@ class LeaseManager:
         except Exception as e:
             logger.error(f"Failed to write lease file: {e}")
 
+
     def allocate_or_renew(self, mac, hostname=None):
         with self.lock:
             current_time = time.time()
-            write_needed = False
             h = f'"{hostname}" ' if hostname else ''
 
+            # STATIC LOGIC
+            if mac in self.static_map:
+                static_ip = self.static_map[mac][0]
+                if not h and self.static_map[mac][1]:
+                    hostname = static_map[mac][1]
+                    h = f'"{hostname}" '
+
+                # We do NOT remove from free_ips here because we already did
+                # it in __init__
+                if not mac in self.leases:
+                    logger.info(f"📌 Assigned static IP {static_ip} to "
+                                f"{h}{mac}")
+
+                # We treat it like a lease so the router knows to add the
+                # route and the system remembers it is active.
+                self.leases[mac] = {
+                    'ip': static_ip,
+                    'expires': current_time + self.lease_time
+                }
+                if hostname:
+                    self.leases[mac]['hostname'] = hostname
+                self.ip_to_mac[static_ip] = mac
+
+                # Save, so we have persistence (optional for static, but keeps
+                # state consistent)
+                self.save_leases()
+                return static_ip
+
             # RENEWAL
+            write_needed = False
             if mac in self.leases:
                 lease = self.leases[mac]
                 old_expires = lease['expires']
@@ -104,6 +258,8 @@ class LeaseManager:
 
                 lease['expires'] = new_expires
 
+                # If the caller didn't know the hostname, but there is a
+                # name in the database, we can use that now.
                 if not h and 'hostname' in lease:
                     h = f'"{lease['hostname']}" '
 
@@ -221,11 +377,17 @@ class RateLimiter:
 class UnnumberedDHCPServer:
     def __init__(self, interface, server_ip=None, pool_cidr=None,
                  dns_server=None, lease_time=LEASE_TIME,
-                 lease_file=LEASE_FILE):
+                 lease_file=LEASE_FILE, static_map=None,
+                 compat_macs=None, compat_ouis=None, compat_vendors=None):
         self.iface = interface
         self.lease_time = lease_time
         self.lease_file = lease_file
         self.limiter = RateLimiter(rate=2.0, burst=5)
+
+        # Compatibility Configuration
+        self.compat_macs = set(m.lower() for m in (compat_macs or []))
+        self.compat_ouis = set(o.lower() for o in (compat_ouis or []))
+        self.compat_vendors = set(v.lower() for v in (compat_vendors or []))
 
         # Detect IP/Pool
         if not server_ip or not pool_cidr:
@@ -256,7 +418,12 @@ class UnnumberedDHCPServer:
 
         # Pass configs to LeaseManager
         self.lease_mgr = LeaseManager(self.pool_cidr, self.server_ip,
-                                      self.lease_file, self.lease_time)
+                                      self.lease_file, self.lease_time,
+                                      static_map=static_map)
+
+        # Pre-calculate the "wide" mask (e.g., "255.255.255.0")
+        self.wide_netmask = str(self.lease_mgr.network.netmask)
+
         self.sync_kernel_routes()
 
         self.gc_thread = threading.Thread(target=self.garbage_collector,
@@ -317,15 +484,29 @@ class UnnumberedDHCPServer:
         logger.info("✅ Route Sync complete.")
 
     def inject_host_route(self, client_ip):
+        """
+        Idempotent Route Injection:
+        Only talks to the kernel if the route is missing.
+        """
         try:
-            # Check if route already exists to avoid log spam
-            # (In production, pyroute2 raises specific errors, but this is
-            # safe)
-            self.ipr.route("replace",
-                           dst=f"{client_ip}/32", oif=self.if_index)
-            logger.debug(f"mapped {client_ip} -> {self.iface}")
+            # Query the kernel for existing routes to this specific IP/32
+            # family=2 means IPv4
+            routes = self.ipr.get_routes(dst=client_ip, dst_len=32, family=2)
+
+            # Check if any of the returned routes belong to OUR interface
+            for r in routes:
+                # pyroute2 returns a list of dictionaries. 
+                # We check the 'oif' (Output Interface) field.
+                if r.get('oif') == self.if_index:
+                    logger.debug(f"Route for {client_ip} already exists. Skipping.")
+                    return
+
+            # If we get here, the route is missing. Add it.
+            self.ipr.route("replace", dst=f"{client_ip}/32", oif=self.if_index)
+            logger.info(f"✅ Route injected: {client_ip}/32 -> {self.iface}")
+
         except Exception as e:
-            logger.error(f"Route add failed: {e}")
+            logger.error(f"Failed to inject route for {client_ip}: {e}")
 
     def delete_host_route(self, client_ip):
         try:
@@ -390,6 +571,53 @@ class UnnumberedDHCPServer:
 
         return clean_name if clean_name else None
 
+    def should_use_wide_mask(self, pkt, client_mac):
+        """
+        Determines if a client requires legacy treatment (wide subnet mask).
+        """
+        # Check exact MAC
+        if client_mac in self.compat_macs:
+            logger.info(f"⚠️ Legacy Mode: MAC match for {client_mac}")
+            return True
+
+        # Check OUI (manufacturer prefix)
+        # MAC is aa:bb:cc:dd:ee:ff. OUI is first 8 chars (aa:bb:cc)
+        if len(client_mac) >= 8:
+            oui = client_mac[:8]
+            if oui in self.compat_ouis:
+                logger.info(f"⚠️ Legacy Mode: OUI match for {client_mac} "
+                            f"({oui})")
+                return True
+
+        # Check Vendor Class Identifier (option 60)
+        # This allows detecting OS types (e.g., "MSFT 5.0", "Nintendo Switch")
+        if DHCP in pkt and self.compat_vendors:
+            dhcp_opts = {opt[0]: opt[1] \
+                         for opt in pkt[DHCP].options \
+                         if isinstance(opt, tuple)}
+            vendor_id_bytes = dhcp_opts.get('vendor_class_id')
+
+            if vendor_id_bytes:
+                # Decode safely
+                try:
+                    # Try UTF-8, fall back to simple string
+                    if isinstance(vendor_id_bytes, bytes):
+                        vendor_id = vendor_id_bytes.decode(
+                            'utf-8', errors='ignore')
+                    else:
+                        vendor_id = str(vendor_id_bytes)
+
+                    # Check partial matches
+                    for pattern.lower() in self.compat_vendors:
+                        if pattern in vendor_id:
+                            logger.info(f"⚠️ Legacy Mode: Vendor match "
+                                        f"for {client_mac} ('{vendor_id}')")
+                            return True
+                except Exception:
+                    pass
+
+        return False
+
     def handle_dhcp(self, pkt):
         try:
             if not (DHCP in pkt and pkt[DHCP].options):
@@ -397,6 +625,14 @@ class UnnumberedDHCPServer:
 
             # Uncomment to debug DHCP protocol.
             # logger.info(pkt.show(dump=True))
+
+            # Or uncomment here, if all you want to see is the vendor class
+            # if DHCP in pkt:
+            #     opts = {opt[0]: opt[1] for opt in pkt[DHCP].options \
+            #             if isinstance(opt, tuple)}
+            #     if 'vendor_class_id' in opts:
+            #         logger.info(f"Vendor ID for {pkt[Ether].src.lower()}: "
+            #                     f"{opts['vendor_class_id']}")
 
             dhcp_opts = {
                 opt[0]: opt[1]
@@ -490,17 +726,22 @@ class UnnumberedDHCPServer:
         ]
 
         if msg_type != "nak":
+            # Netmask selection. Default to strict isolation.
+            netmask_to_send = self.wide_netmask \
+                if self.should_use_wide_mask(old_pkt, client_mac) \
+                   else "255.255.255.255"
+
             # Generate the raw bytes for Option 121
             opt_121_payload = self.build_option_121(self.server_ip)
 
             options.extend([
                 ("lease_time", self.lease_time),
-                ("subnet_mask", "255.255.255.255"), # /32 isolation
+                ("subnet_mask", netmask_to_send), # /32 isolation
 
                 # --- IMPORTANT: ROUTER OPTION LOGIC ---
-                # RFC 3442 says: If Option 121 is present, clients MUST ignore
-                # Option 3 (Router). So we must provide the default route
-                # inside 121. We add Option 3 anyway for legacy clients that
+                # RFC 3442 says: If option 121 is present, clients MUST ignore
+                # option 3 (Router). So we must provide the default route
+                # inside 121. We add option 3 anyway for legacy clients that
                 # don't understand 121.
                 ("router", self.server_ip),
 
@@ -658,14 +899,20 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "-i", "--interface",
-        default=INTERFACE,
-        help="Network interface to bind to"
+        "-d", "--dns",
+        help="DNS Server IP. If omitted, uses system /etc/resolv.conf."
     )
 
     parser.add_argument(
-        "-s", "--server-ip",
-        help="Static Server IP. If omitted, auto-detected from interface."
+        "-f", "--lease-file",
+        default=LEASE_FILE,
+        help="Path to JSON file for persisting leases."
+    )
+
+    parser.add_argument(
+        "-i", "--interface",
+        default=INTERFACE,
+        help="Network interface to bind to"
     )
 
     parser.add_argument(
@@ -675,8 +922,8 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "-d", "--dns",
-        help="DNS Server IP. If omitted, uses system /etc/resolv.conf."
+        "-s", "--server-ip",
+        help="Static Server IP. If omitted, auto-detected from interface."
     )
 
     parser.add_argument(
@@ -687,9 +934,30 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "-f", "--lease-file",
-        default=LEASE_FILE,
-        help="Path to JSON file for persisting leases."
+        "--compat-mac",
+        action='append',
+        help="Treat this MAC as legacy (send wide netmask). Can be repeated."
+    )
+
+    parser.add_argument(
+        "--compat-oui",
+        action='append',
+        help="Treat this MAC prefix (e.g. '00:11:22') as legacy. Can be " \
+             "repeated."
+    )
+
+    parser.add_argument(
+        "--compat-vendor",
+        action='append',
+        help="Treat clients with this Vendor ID string (option 60) as " \
+             "legacy. e.g. 'MSFT 5.0'"
+    )
+
+    parser.add_argument(
+        "--static",
+        action='append',
+        help="Map a MAC to an IP. Format: --static aa:bb:cc:dd:ee:ff=" \
+             "10.100.0.50{,hostname}"
     )
 
     args = parser.parse_args()
@@ -707,6 +975,30 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, graceful_exit)
     signal.signal(signal.SIGHUP, graceful_exit)
 
+    # Parse static maps
+    static_map = {}
+    if args.static:
+        for item in args.static:
+            try:
+                parts = item.split('=')
+                if len(parts) != 2:
+                    raise ValueError("Format must be MAC=IP{,hostname}")
+                mac = parts[0].strip().lower()
+                val = parts[1].strip().split(',')
+                ip = val[0].strip().lower()
+                hostname = val[1].strip().lower() if len(val) > 1 else None
+
+                # Basic validation
+                if not re.match(r"[0-9a-f]{2}([:][0-9a-f]{2}){5}$", mac):
+                    logger.error(f"Invalid MAC in static map: {mac}")
+                    exit(1)
+                ipaddress.IPv4Address(ip) # Check if valid IP
+
+                static_map[mac] = (ip, hostname)
+            except Exception as e:
+                logger.critical(f"Failed to parse static map '{item}': {e}")
+                exit(1)
+
     # Pass parsed arguments to the server constructor
     server = None
     try:
@@ -716,7 +1008,11 @@ if __name__ == "__main__":
             pool_cidr=args.pool,
             dns_server=args.dns,
             lease_time=args.lease_time,
-            lease_file=args.lease_file
+            lease_file=args.lease_file,
+            static_map=static_map,
+            compat_macs=args.compat_mac,
+            compat_ouis=args.compat_oui,
+            compat_vendors=args.compat_vendor
         )
         server.start()
     except (KeyboardInterrupt, SystemExit):
