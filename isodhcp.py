@@ -673,7 +673,11 @@ class LeaseManager:
                     # Dynamically allocate standard IP address (/32)
                     else:
                         if self.free_ips:
-                            target_ip = self.free_ips.pop()
+                            # Minimize memory fragmentation by picking the
+                            # highest available IP address, leaving the bottom
+                            # pool open for aligned /30 blocks
+                            target_ip = max(self.free_ips,
+                                            key=ipaddress.IPv4Address)
                             nft_compat_flag = False
 
             # Commit the new state
