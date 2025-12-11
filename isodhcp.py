@@ -575,6 +575,22 @@ class LeaseManager:
         except: pass
         return False
 
+    def decline_ip(self, mac, ip):
+        '''Handles DHCPDECLINE. Revokes lease and quarantines IP.'''
+        with self.lock:
+            # Prevent a rogue client from declining someone else's IP.
+            current_owner = self.ip_to_mac.get(ip)
+            if current_owner and current_owner != mac:
+                logger.warning(f'⚠️ Security: Ignored spoofed DECLINE for {ip} '
+                               f'from {mac} (owned by {current_owner})')
+                return
+            if current_owner == mac:
+                self.release(mac)
+            if ip in self.free_ips:
+                self.free_ips.remove(ip)
+            logger.warning(f'⚠️ Received DECLINE for {ip} from {mac}. '
+                           f'Quarantining for 10 min.')
+            self.quarantine[ip] = time.time() + 600
 
     def process_quarantine_expiry(self):
         '''Lazy cleanup: Checks expired quarantine entries.
@@ -1319,7 +1335,7 @@ class UnnumberedDHCPServer:
             is_compat = self.should_use_wide_mask(pkt, client_mac)
             is_masq = self.should_masquerade(pkt, client_mac)
 
-            # DISCOVER (Client needs an IP)
+            # DHCPDISCOVER (Client needs an IP)
             if msg_type == 1:
                 assigned_ip = self.lease_mgr.allocate_or_renew(
                     client_mac, hostname=hostname, is_compat=is_compat,
@@ -1327,7 +1343,7 @@ class UnnumberedDHCPServer:
                 if assigned_ip:
                     self.send_reply(pkt, 'offer', assigned_ip, xid, client_mac)
 
-            # REQUEST (Client accepts offer or renews)
+            # DHCPREQUEST (Client accepts offer or renews)
             elif msg_type == 3:
                 req_ip = self.get_client_requested_ip(pkt)
 
@@ -1359,7 +1375,15 @@ class UnnumberedDHCPServer:
                                    f'it belongs to {h}{current_owner_mac}')
                     self.send_reply(pkt, 'nak', req_ip, xid, client_mac)
 
-            # RELEASE (Client is shutting down politely)
+            # DHCPDECLINE (Client suspects IP address of being used by a rogue)
+            elif msg_type == 4:
+                req_ip = self.get_client_requested_ip(pkt)
+                if req_ip:
+                    logger.info(f'📩 Received DECLINE from {client_mac} for '
+                                f'{req_ip}')
+                    self.lease_mgr.decline_ip(client_mac, req_ip)
+
+            # DHCPRELEASE (Client is shutting down politely)
             elif msg_type == 7:
                  req_ip = pkt[BOOTP].ciaddr
                  # Only allow release if the IP actually belongs to them
@@ -1369,10 +1393,20 @@ class UnnumberedDHCPServer:
                          try: self.ipr.route('del', dst=f'{released_ip}/32',
                                              oif=self.if_index)
                          except: pass
+
+            # DHCPINFORM (Client has static IP, but needs other data)
+            elif msg_type == 8:
+                client_ip = pkt[BOOTP].ciaddr
+                if client_ip == '0.0.0.0': return
+                logger.info(f'ℹ️ Received INFORM from {client_ip} '
+                            f'({client_mac})')
+                self.send_reply(pkt, 'ack', client_ip, xid, client_mac,
+                                is_inform=True)
         except Exception as e:
             logger.error(f'⚠️ Malformed packet caused crash: {e}')
 
-    def send_reply(self, old_pkt, msg_type, client_ip, xid, client_mac):
+    def send_reply(self, old_pkt, msg_type, client_ip, xid, client_mac,
+                   is_inform=False):
         op_code = 5 if msg_type == 'ack' else 2 # Ack or Offer
         if msg_type == 'nak': op_code = 6
 
@@ -1382,15 +1416,20 @@ class UnnumberedDHCPServer:
         ]
 
         if msg_type != 'nak':
+            is_compat = self.should_use_wide_mask(old_pkt, mac)
             router_ip = self.server_ip
             netmask_to_send = '255.255.255.255'
-            compat = self.lease_mgr.subnet_leases.get(client_mac)
-            if compat:
-                router_ip = compat['gateway']
+
+            if is_compat and mac in self.lease_mgr.subnet_leases:
+                router_ip = self.lease_mgr.subnet_leases['gateway']
                 netmask_to_send = '255.255.255.252'
+
             opt121 = b'\x00' + socket.inet_aton(router_ip)
+
+            if not is_inform:
+                options.append(('lease_time', self.lease_time))
+
             options.extend([
-                ('lease_time', self.lease_time),
                 ('subnet_mask', netmask_to_send), # /32 or /30 isolation
                 ('name_server', self.dns_server),
 
@@ -1407,20 +1446,23 @@ class UnnumberedDHCPServer:
                 # Option 249: MS-Classless Static Route (Microsoft Legacy)
                 # Older Windows versions (XP/2003) looked for option 249
                 # with the exact same format. It's safe to send both.
-                (249, opt121)
+                (249, opt121),
             ])
         options.append('end')
 
+        yiaddr_val = '0.0.0.0' if msg_type == 'nak' or is_inform else client_ip
         reply = (
             Ether(src=self.server_mac, dst=client_mac) /
             IP(src=self.server_ip, dst=client_ip) /
             UDP(sport=67, dport=68) /
-            BOOTP(op=2, yiaddr=client_ip if msg_type != 'nak' else '0.0.0.0',
-                  siaddr=self.server_ip, giaddr=0, chaddr=mac2str(client_mac),
-                  xid=xid) /
+            BOOTP(op=2, yiaddr=yiaddr_val, siaddr=self.server_ip, giaddr=0,
+                  chaddr=mac2str(client_mac), xid=xid,
+                  ciaddr=client_ip if is_inform else '0.0.0.0') /
             DHCP(options=options)
         )
         sendp(reply, iface=self.iface, verbose=False)
+        log_type = 'INFORM_ACK' if is_inform else msg_type.upper()
+        logger.info(f'📤 Sent {log_type} to {client_ip} ({mac})')
 
     def get_system_dns(self):
         '''
@@ -1447,7 +1489,7 @@ class UnnumberedDHCPServer:
         # If we found nothing, or we found the systemd stub (127.0.0.53),
         # we need to dig deeper.
         if not candidates or (candidates and candidates[0].startswith('127.')):
-            logger.info('⚠️  Detected local DNS stub (systemd-resolved). '
+            logger.info('⚠️ Detected local DNS stub (systemd-resolved). '
                         'Looking for upstream DNS...')
 
             # systemd-resolved keeps the "real" upstream servers in this
