@@ -1,0 +1,5 @@
+#!/bin/bash
+# Find our installation directory and then invoke Python through
+# a suitable link to ensure the process list has our program name
+p="$(readlink -f "$(type --path "$0")")"; p="${p%/*}"
+exec "${p}"/venv/bin/isodhcp "${p}"/isodhcp.py "$@"

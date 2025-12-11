@@ -7,6 +7,7 @@ After=time-sync.target
 [Service]
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
+ExecReload=/bin/kill -USR1 $MAINPID
 ExecStart=/usr/local/lib/isodhcp/venv/bin/isodhcp /usr/local/lib/isodhcp/isodhcp.py --interface guest --dns 1.1.1.2
 NoNewPrivileges=yes
 PrivateTmp=yes
