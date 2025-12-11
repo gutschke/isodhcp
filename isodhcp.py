@@ -223,6 +223,7 @@ class LeaseManager:
                                 # client_mac -> {gateway: ip, subnet: ip}
         self.leases = {}     # MAC -> {'ip': str, 'expires': float,
                              #         'hostname': str (opt) }
+        self.quarantine = {}
         self.ip_to_mac = {}  # IP -> MAC
 
         # Calculate free IPs
@@ -554,9 +555,72 @@ class LeaseManager:
         # Find the minimum 'expires' float in the values
         return min(d['expires'] for d in self.leases.values())
 
+    def is_ip_active_in_arp(self, ip_str):
+        '''
+        Checks if the kernel has a valid ARP entry for this IP.
+        Returns True if the IP appears to be in use by a rogue device.
+        '''
+        try:
+            with IPRoute() as ipr:
+                # Get specific neighbor
+                neighbors = ipr.get_neighbours(dst=ip_str, family=2)
+                for n in neighbors:
+                    state = n['state']
+                    # States: 1=INCOMPLETE, 2=REACHABLE, 4=STALE, 8=DELAY,
+                    # 16=PROBE, 32=FAILED, 64=NOARP, 128=PERMANENT
+                    # We consider it 'Active' if it's Reachable, Stale, Delay, or Probe.
+                    # We ignore Failed/Incomplete.
+                    if state in (2, 4, 8, 16):
+                        return True
+        except: pass
+        return False
+
+
+    def process_quarantine_expiry(self):
+        '''Lazy cleanup: Checks expired quarantine entries.
+        If they are still active on wire, extends quarantine.
+        If they are quiet, restores them to the free pool.'''
+        now = time.time()
+
+        expired_ips = [
+            ip for ip, expiry in self.quarantine.items() if now > expiry]
+        if not expired_ips:
+            return
+
+        active_on_wire = set()
+        try:
+            with IPRoute() as ipr:
+                neighbors = ipr.get_neighbours(family=2)
+                for n in neighbors:
+                    # Check for active states (Reachable, Stale, Delay, Probe)
+                    if n['state'] in (2, 4, 8, 16): 
+                        for attr, val in n['attrs']:
+                            if attr == 'NDA_DST':
+                                active_on_wire.add(val)
+        except: pass
+
+        restored_count = 0
+        for ip in expired_ips:
+            if ip in active_on_wire:
+                # Still active? Extend sentence by 5 mins
+                self.quarantine[ip] = now + 300
+            else:
+                # Quiet? Release.
+                del self.quarantine[ip]
+                # Only add back if valid and not assigned static
+                if ip in self.all_possible_ips and ip not in self.ip_to_mac:
+                    self.free_ips.add(ip)
+                    restored_count += 1
+
+        if restored_count > 0:
+            logger.info(f'♻️ Released {restored_count} IPs from quarantine.')
+
     def allocate_or_renew(self, mac, hostname=None, is_compat=False,
                           is_masq=False):
         with self.cv:
+            if self.quarantine:
+                self.process_quarantine_expiry()
+
             current_time = time.time()
             h = f'"{hostname}" ' if hostname else ''
             target_ip = None
@@ -673,12 +737,27 @@ class LeaseManager:
                     # Dynamically allocate standard IP address (/32)
                     else:
                         if self.free_ips:
-                            # Minimize memory fragmentation by picking the
-                            # highest available IP address, leaving the bottom
-                            # pool open for aligned /30 blocks
-                            target_ip = max(self.free_ips,
-                                            key=ipaddress.IPv4Address)
-                            nft_compat_flag = False
+                            for _ in range(5):
+                                if not self.free_ips: break
+                                # Minimize memory fragmentation by picking the
+                                # highest available IP address, leaving the
+                                # bottom pool open for aligned /30 blocks
+                                candidate = max(self.free_ips,
+                                                key=ipaddress.IPv4Address)
+                                self.free_ips.remove(candidate)
+                                if self.is_ip_active_in_arp(candidate):
+                                    logger.warning(f'⚠️ IP {candidate} is free '
+                                                   f'in DB but active on wire!')
+                                    self.quarantine[candidate] = \
+                                        current_time + 300
+                                    continue
+                                target_ip = candidate
+                                nft_compat_flag = False
+                                break
+                            if not target_ip:
+                                logger.error('❌ Pool exhausted (or all '
+                                             'candidates busy on wire).')
+                                return None
 
             # Commit the new state
             if not target_ip:
