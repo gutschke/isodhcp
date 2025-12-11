@@ -1421,7 +1421,7 @@ class UnnumberedDHCPServer:
             netmask_to_send = '255.255.255.255'
 
             if is_compat and mac in self.lease_mgr.subnet_leases:
-                router_ip = self.lease_mgr.subnet_leases['gateway']
+                router_ip = self.lease_mgr.subnet_leases[mac]['gateway']
                 netmask_to_send = '255.255.255.252'
 
             opt121 = b'\x00' + socket.inet_aton(router_ip)
@@ -1535,7 +1535,8 @@ class UnnumberedDHCPServer:
             raw_addrs = ipr.get_addr(index=idx, family=2)
 
             if not raw_addrs:
-                raise ValueError(f'No IPv4 address assigned to "{iface_name}"')
+                raise ValueError(f'⚠️ No IPv4 address assigned to '
+                                 f'"{iface_name}"')
 
             # Sort by prefix length in ascending order. We want the smallest
             # prefix (e.g. 24) to win over larger ones (e.g. 30 or 32). This
@@ -1554,7 +1555,8 @@ class UnnumberedDHCPServer:
                     break
 
             if not local_ip:
-                raise ValueError(f'Could not determine IP for "{iface_name}"')
+                raise ValueError(f'⚠️ Could not determine IP for '
+                                 f'"{iface_name}"')
 
             # Calculate network CIDR using ipaddress library
             # Creates an interface object like '192.168.1.1/24'
@@ -1727,7 +1729,7 @@ if __name__ == '__main__':
         This breaks the Scapy loop and triggers the 'finally' block.
         '''
         sig_name = signal.Signals(signum).name
-        logger.info(f'⚠️  Received signal: {sig_name}')
+        logger.info(f'⚠️ Received signal: {sig_name}')
         sys.exit(0)
     def handle_reload(signum, frame):
         '''Handles systemctl reload (SIGUSR1)'''
@@ -1764,12 +1766,12 @@ if __name__ == '__main__':
 
                 # Basic validation
                 if not re.match(r'[0-9a-f]{2}([:][0-9a-f]{2}){5}$', mac):
-                    logger.error(f'Invalid MAC in static map: {mac}')
+                    logger.error(f'⚠️ Invalid MAC in static map: {mac}')
                     sys.exit(1)
                 ipaddress.IPv4Address(ip) # Check if valid IP
                 static_map[mac] = (ip, hostname)
             except Exception as e:
-                logger.critical(f'Failed to parse static map "{item}": {e}')
+                logger.critical(f'⚠️ Failed to parse static map "{item}": {e}')
                 sys.exit(1)
 
     # Pass parsed arguments to the server constructor
