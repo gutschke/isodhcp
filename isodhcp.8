@@ -9,13 +9,20 @@ isodhcp \- Unnumbered DHCP Server with Client Isolation
 [\fB\-d\fR \fIdns_server\fR]
 [\fB\-t\fR \fIlease_time\fR]
 [\fB\-f\fR \fIlease_file\fR]
-[\fB\-\-static\fR \fImac=ip[,hostname][,compat][,masquerade]\fR]...
+[\fB\-\-static\fR \fImac=ip[,hostname][,compat][,masquerade][,playground]\fR]...
+[\fB\-\-dhcp\-option\fR \fICODE,TYPE,VALUE\fR]...
+[\fB\-\-playground\-size\fR \fIn\fR]
+[\fB\-\-playground\-mac\fR \fImac\fR]...
+[\fB\-\-playground\-oui\fR \fIprefix\fR]...
+[\fB\-\-playground\-vendor\fR \fIstring\fR]...
 [\fB\-\-compat\-mac\fR \fImac\fR]...
 [\fB\-\-compat\-oui\fR \fIprefix\fR]...
 [\fB\-\-compat\-vendor\fR \fIstring\fR]...
 [\fB\-\-masquerade\-mac\fR \fImac\fR]...
 [\fB\-\-masquerade\-oui\fR \fIprefix\fR]...
 [\fB\-\-masquerade\-vendor\fR \fIstring\fR]...
+[\fB\-\-nft\-set\-playground\fR \fIset_name\fR]
+[\fB\-\-nft\-set\-playground\-subnet\fR \fIset_name\fR]
 [\fB\-\-nft\-set\-isolated\fR \fIset_name\fR]
 [\fB\-\-nft\-set\-compat\fR \fIset_name\fR]
 [\fB\-\-nft\-set\-gateway\fR \fIset_name\fR]
@@ -26,79 +33,71 @@ isodhcp \- Unnumbered DHCP Server with Client Isolation
 [\fB\-\-isolation\fR \fI{on,off,system}\fR]
 .SH DESCRIPTION
 .B isodhcp
-is a lightweight, specialized DHCP server designed for secure Linux
-routers hosting Guest, IoT, or untrusted networks.
+is a specialized DHCP server designed for secure Linux routers hosting guest,
+IoT, or untrusted networks. It prioritizes Layer 3 client isolation and strictly
+controls network topology based on client classification.
+
+It operates in three distinct modes:
+
+.B 1. Isolated Mode (Standard):
+The default behavior. Assigns clients a \fB/32\fR subnet mask. The server
+injects a specific host route into the kernel for each client. This forces all
+traffic to pass through the gateway, enabling strict isolation.
+
+.B 2. Micro-Segmentation Mode (Compatibility):
+For "Legacy" devices that malfunction with /32 masks (e.g., game consoles), the
+server dynamically allocates a tiny \fB/30\fR subnet (4 IPs). It creates a
+secondary IP alias on the router interface to serve as the gateway for that
+specific client.
+
+.B 3. Playground Mode:
+A reserved, contiguous subnet carved out of the main pool for devices that
+require standard Layer 2 visibility (e.g., Chromecast, Apple TV). Clients in
+the playground share a standard subnet mask (e.g., /26) and can communicate
+with each other, even if global isolation is enforced.
 
 .PP
-Unlike standard DHCP servers, \fBisodhcp\fR utilizes an "Unnumbered
-Interface" architecture. It assigns clients a \fB/32\fR subnet mask
-(255.255.255.255), forcing all traffic \- even traffic destined for
-other devices on the same physical wire \- to route through the gateway.
-
-.PP
-Simultaneously, \fBisodhcp\fR interacts directly with the Linux kernel using
-\fBnetlink\fR to inject explicit host routes for every connected client.
-This combination allows the administrator to implement strict layer 3 client
-isolation and granular firewalling (via \fBNFTables\fR) on the router,
-effectively treating a shared Ethernet segment as a collection of
-point-to-point links.
-
-.PP
-For legacy clients that lack support for point-to-point \fB/32\fR netmasks,
-\fBisodhcp\fR can operate in a micro-segmentation mode that helps
-with compatibility problems. For these clients, \fBisodhcp\fR dynamically
-carves a \fB/30\fR subnet (4 IPs) out of the main pool. It assigns a secondary
-alias IP to the router interface to serve as the gateway for that specific
-client. The client sees a standard broadcast domain, but is effectively
-isolated in its own tiny subnet.
-
-.PP
-Furthermore \fBisodhcp\fR can utilize source NAT'ing to make all traffic that
-is directed towards a client look as if it originated from the gateway address
-assigned to that client. This can help with restricted network implementations.
-
-.PP
-The daemon uses raw sockets (via \fBscapy\fR) to handle DHCP traffic, bypassing
-standard UDP listeners. It includes built-in rate limiting to prevent DoS
-attacks and manages lease persistence via a JSON file.
+The server features built-in DoS protection (quarantine), ARP conflict
+detection, and robust integration with \fBnftables\fR for high-performance
+firewalling.
 
 .SH OPTIONS
 .TP
-.B \-d \fIdns\fR, \fB\-\-dns\fR \fIdns\fR
+\fB\-d\fR \fIdns\fR, \fB\-\-dns\fR \fIdns\fR
 The DNS server IP address to offer clients. If omitted, the server parses
 \fI/etc/resolv.conf\fR (and systemd-resolved upstream configurations) to find a
 valid IPv4 nameserver.
 
 .TP
-.B \-f \fIpath\fR, \fB\-\-lease-file\fR \fIpath\fR
+\fB\-f\fR \fIpath\fR, \fB\-\-lease-file\fR \fIpath\fR
 Path to the JSON file where lease state is persisted. Defaults to
 \fIdhcp_leases_{INTERFACE}.json\fR in the current working directory. The server writes to
 this file on allocation, release, and shutdown. To minimize disk wear, renewals
 are only written if the expiration time changes significantly.
 
 .TP
-.B \-i \fIinterface\fR, \fB\-\-interface\fR \fIinterface\fR
+\fB\-i\fR \fIinterface\fR, \fB\-\-interface\fR \fIinterface\fR
 The network interface to listen on (e.g., \fIeth1\fR, \fIwlan0\fR). The server
 binds specifically to this interface to avoid conflicts with other DHCP servers
 on the host. Defaults to \fIguest\fR.
 
 .TP
-.B \-p \fIpool\fR, \fB\-\-pool\fR \fIpool\fR
+\fB\-p\fR \fIpool\fR, \fB\-\-pool\fR \fIpool\fR
 The CIDR range of IPs to allocate (e.g., \fI10.100.0.0/24\fR). If omitted, the
 server attempts to auto-detect the subnet configured on the interface.
 
 .TP
-.B \-s \fIserver_ip\fR, \fB\-\-server-ip\fR \fIserver_ip\fR
+\fB\-s\fR \fIserver_ip\fR, \fB\-\-server-ip\fR \fIserver_ip\fR
 The IP address of the router (gateway). If omitted, the server attempts to
 auto-detect the primary IP address assigned to the interface specified
 by \fB\-i\fR.
 
 .TP
-.B \-t \fIseconds\fR, \fB\-\-lease-time\fR \fIseconds\fR
+\fB\-t\fR \fIseconds\fR, \fB\-\-lease-time\fR \fIseconds\fR
 The duration of the DHCP lease in seconds. Defaults to \fI3600\fR (1 hour).
 
 .TP
-.B \-\-compat\-mac \fImac\fR
+\fB\-\-compat\-mac\fR \fImac\fR
 Treat the specified MAC address as a "legacy" client. Instead of receiving the
 standard strict \fB/32\fR netmask (client isolation), this device will be
 assigned a \fB/30\fR micro-segment with a netmask of \fB255.255.255.252\fR).
@@ -109,7 +108,7 @@ accept a gateway outside of their own subnet mask.
 Example: \fI\-\-compat\-mac 00:11:22:33:44:55\fR
 
 .TP
-.B \-\-compat\-oui \fIoui\fR
+\fB\-\-compat\-oui\fR \fIoui\fR
 Treat any device whose MAC address starts with this 3-byte prefix
 (Organizationally Unique Identifier) as a legacy client.
 .br
@@ -118,7 +117,7 @@ The OUI format is \fIAA:BB:CC\fR. Case is insensitive.
 Example: \fI\-\-compat\-oui B8:27:EB\fR (Raspberry Pi Foundation)
 
 .TP
-.B \-\-compat\-vendor \fIstring\fR
+\fB\-\-compat\-vendor\fR \fIstring\fR
 Treat any device sending a DHCP Vendor Class Identifier (option 60) containing
 this substring as a legacy client.
 .br
@@ -128,45 +127,60 @@ unnumbered interfaces.
 Example: \fI\-\-compat\-vendor "MSFT 5.0"\fR
 
 .TP
-.B \-\-masquerade\-mac \fImac\fR
+\fB\-\-masquerade\-mac\fR \fImac\fR
 The device with this MAC will have their traffic source NAT'd (SNAT) by the
 router. Traffic destined for these clients will appear to originate from the
 gateway IP itself, rather than the original sender.
 
 .TP
-.B \-\-masquerade\-oui \fIprefix\fR
+\fB\-\-masquerade\-oui\fR \fIprefix\fR
 Apply source NAT to any device whose MAC address starts with this
 3-byte prefix.
 
 .TP
-.B \-\-masquerade\-vendor \fIprefix\fR
+\fB\-\-masquerade\-vendor\fR \fIprefix\fR
 Apply source NAT to any device that matches this DHCP Vendor Class Identifier.
 
 .TP
-.B \-\-nft\-set\-isolated \fIname\fR
+\fB\-\-nft\-set\-playground\fR \fIname\fR
 The daemon can populate named \fBNFTables\fR sets for integration with
 firewall rules. Each option can only be given once and specifies an
 optional name for a set (e.g., \fI"inet filter iso_clients"\fR). The set will
-not be created if it doesn't already exist. \fB\-\-nft\-set\-isolated\fR names
-the set for standard \fB/32\fR clients.
+not be created if it doesn't already exist. \fB\-\-nft\-set\-playground\fR names
+the set for playground (typically \fB/24\fR .. \fB/29\fR) clients, that are
+not isolated from each other.
+
 .TP
-.B \-\-nft\-set\-compat \fIname\fR
+\fB\-\-nft\-set\-playground\-subnet\fR \fIname\fR
+Set for the subnet that contains all playground clients.
+
+.TP
+\fB\-\-nft\-set\-isolated\fR \fIname\fR
+Set for isolated \fB/32\fR clients.
+
+.TP
+\fB\-\-nft\-set\-compat\fR \fIname\fR
 Set for legacy \fB/30\fR clients.
+
 .TP
-.B \-\-nft\-set\-gateway \fIname\fR
+\fB\-\-nft\-set\-gateway\fR \fIname\fR
 Set for the dynamic gateway IPs created for \fB/30\fR blocks.
+
 .TP
-.B \-\-nft\-set\-network \fIname\fR
+\fB\-\-nft\-set\-network\fR \fIname\fR
 Set for the network addresses of \fB/30\fR blocks.
+
 .TP
-.B \-\-nft\-set\-broadcast \fIname\fR
+\fB\-\-nft\-set\-broadcast\fR \fIname\fR
 Set for the broadcast addresses of \fB/30\fR blocks.
+
 .TP
-.B \-\-nft\-set\-subnet \fIname\fR
-Set for the CIDR blocks of \fB/30\fR allocations. \fBNote:\fR This set must have
-the \fBinterval\fR flag enabled in \fBNFTables\fR.
+\fB\-\-nft\-set\-subnet\fR \fIname\fR
+Set for the CIDR blocks of \fB/30\fR allocations. \fBNote:\fR This set must
+have the \fBinterval\fR flag enabled in \fBNFTables\fR.
+
 .TP
-.B \-\-static \fImac=ip[,hostname][,compat][,masquerade]\fR
+\fB\-\-static\fR \fImac=ip[,hostname][,compat][,masquerade][,playground]\fR
 Map a MAC to a specific IP. Can be repeated.
 .br
 \fBhostname\fR: (Optional) string to log for this device.
@@ -176,6 +190,9 @@ compatibility mode.
 .br
 \fBmasquerade\fR: (Optional) enable source NAT for this client.
 .br
+\fBplayground\R: (Optional) Assign to the shared playground subnet. IP must be
+within the calculated playground range.
+.br
 .B Note:
 For \fIcompat\fR entries, the IP must be the ".2" offset of a valid
 \fB/30\fR block (e.g., .2, .6, .10). The server will reserve the entire 4-IP
@@ -184,23 +201,54 @@ block immediately at startup.
 Static entries are initialized immediately at startup. The server configures the
 interface, routes, and firewall rules before the client even connects. These
 addresses are permanently removed from the free pool.
+
 .TP
-.B \-\-hook\-file \fIpath\fR
+\fB\-\-dhcp\-option\fR \fICODE,TYPE,VALUE\fR
+Inject custom options into DHCP replies.
+.br
+\fBTYPE:\fR \fIip\fR, \fIips\fR (list), \fIstr\fR, \fIint8\fR, \fIint16\fR, \fIint32\fR, \fIhex\fR.
+.br
+\fBVALUE:\fR The data. For \fIhex\fR, colons are optional.
+
+.TP
+\fB\-\-playground\-size\fR \fIn\fR
+Number of IPs to reserve. Must be > 5. The server rounds up to the next CIDR
+boundary (e.g., 50 -> 64 -> /26). If size equals the pool size, the server
+behaves like a traditional DHCP server (no isolation).
+
+.TP
+\fB\-\-playground\-mac\fR \fImac\fR
+
+.TP
+\fB\-\-playground\-oui\fR \fIprefix\fR
+
+.TP
+\fB\-\-playground\-vendor\fR \fIstring\fR
+Assign matching clients to the playground. An empty string for vendor matches
+\fIall\fR clients.
+
+.TP
+\fB\-\-hook\-file\fR \fIpath\fR
 Path to an executable script (e.g., shell or Python) that is invoked whenever a
 lease is added or released. See \fBHOOK SCRIPT\fR below for details.
+
 .TP
-.B \-\-isolation \fI{on,off,system}\fR
+\fB\-\-isolation\fR \fI{on,off,system}\fR
 In the vast majority of cases, the job of \fBisodhcp\fR is done as soon as it
-sends all traffic through the level 3 router. Policy decisions are supposed to
-be enforced by a third-party firewall. But sometimes, the situation is easy
-enough that it only requires minimal firewall rules. In that case, the daemon
-can be configured to actively block ("on") or actively allow ("off")
-communication between clients. The default is "system", which leaves the
-firewall unconfigured.
+sends all traffic through the layer 3 router. Policy decisions are supposed to
+be enforced by a third-party firewall. \fB\-\-isolation\fR provides minimal
+built-in firewall support for the \fBforward\fR chain policy:
+.br
+\fBon\R: DROPs intra-subnet traffic except for playground-to-playground.
+.br
+\fBoff\fR: ACCEPTs intra-subnet traffic.
+.br
+\fBsystem\fR: Adds no rules and relies on external firewall.
 
 .SH HOOK SCRIPT
 If \fB\-\-hook\-file\fR is specified, the server executes the script
 asynchronously on lease changes.
+
 .PP
 \fBArguments:\fP
 .br
@@ -214,6 +262,10 @@ $4 = Hostname (if available)
 
 .PP
 \fBEnvironment Variables:\fP
+
+.TP
+.B ISODHCP_MODE
+The client mode: \fBstandard\fR, \fBcompat\fR, or \fBplayground\fR.
 .TP
 .B ISODHCP_PID
 Process ID of the server.
@@ -248,6 +300,9 @@ Current isolation mode. Can be "on", "off" or "system".
 .B ISODHCP_COMPAT
 "1" if legacy/compat mode is enabled, else "0".
 .TP
+.B ISODHCP_EXPIRY
+Lease expiration timestamp (UNIX epoch) or "inf".
+.TP
 .B ISODHCP_GATEWAY
 The specific gateway IP assigned to this client (varies for /30 clients).
 .TP
@@ -263,6 +318,7 @@ The specific subnet assigned to this /30 client.
 .B SIGINT, SIGTERM, SIGHUP
 The server catches these signals to perform an orderly shutdown. It flushes the
 current state of all leases to the JSON file before exiting.
+
 .TP
 .B SIGUSR1
 Reload configuration state. The server will re-scan the in-memory leases and
@@ -342,7 +398,30 @@ isodhcp \-i guest0 \\
 .fi
 
 .PP
-\fB2. Static legacy reservation\fP
+\fB8. Hybrid setup with playground\fP
+.br
+Run on \fIguest\fR. Isolate most clients, but provide a 32-IP playground for
+Nintendo Switch consoles (OUI 98:B6:E9) and Apple TVs (Vendor "tvOS").
+Masquerade the consoles. Advertise an NTP server at "192.168.1.1".
+.IP
+.nf
+isodhcp \-i guest \-\-playground\-size 32 \\
+  \-\-playground\-oui 98:B6:E9 \\
+  \-\-playground\-vendor "tvOS" \\
+  \-\-masquerade\-oui 98:B6:E9 \\
+  \-\-dhcp\-option "42,ip,192.168.1.1"
+.fi
+
+.PP
+\fB9. Unifi controller DHCP option\fP
+.br
+Send option 43 (vendor specific) to Ubiquiti devices pointing to
+controller 192.168.1.10:
+.IP
+.B isodhcp \-\-dhcp\-option "43,hex,01:04:C0:A8:01:0A"
+
+.PP
+\fB10. Static legacy reservation\fP
 .br
 Assign a printer to 10.100.0.10. Force it to use a /30 subnet (occupying
 10.100.0.8/30) because it doesn't support /32:
@@ -358,13 +437,16 @@ has write permissions to this file (or directory).
 .SH SECURITY & PERMISSIONS
 To run \fBisodhcp\fR as an unprivileged user, the process requires the
 following Linux capabilities:
+
 .TP
 .B CAP_NET_RAW
 Required to open raw sockets for sending/receiving DHCP packets via Scapy.
+
 .TP
 .B CAP_NET_ADMIN
 Required to modify the kernel routing table (adding/removing /32 routes via
 \fBnetlink\fR).
+
 .TP
 .B CAP_NET_BIND_SERVICE
 Required to bind to port 67 (optional, depending on implementation

@@ -3,7 +3,7 @@
 Linux, December 2025
 
 ```
-isodhcp [-i interface] [-s server_ip] [-p pool_cidr] [-d dns_server] [-t lease_time] [-f lease_file] [--static mac=ip[,hostname][,compat][,masquerade]]... [--compat-mac mac]... [--compat-oui prefix]... [--compat-vendor string]... [--masquerade-mac mac]... [--masquerade-oui prefix]... [--masquerade-vendor string]... [--nft-set-isolated set_name] [--nft-set-compat set_name] [--nft-set-gateway set_name] [--nft-set-network set_name] [--nft-set-broadcast set_name] [--nft-set-subnet set_name]... [--hook-file path] [--isolation {on,off,system}]
+isodhcp [-i interface] [-s server_ip] [-p pool_cidr] [-d dns_server] [-t lease_time] [-f lease_file] [--static mac=ip[,hostname][,compat][,masquerade][,playground]]... [--dhcp-option CODE,TYPE,VALUE]... [--playground-size n] [--playground-mac mac]... [--playground-oui prefix]... [--playground-vendor string]... [--compat-mac mac]... [--compat-oui prefix]... [--compat-vendor string]... [--masquerade-mac mac]... [--masquerade-oui prefix]... [--masquerade-vendor string]... [--nft-set-playground set_name] [--nft-set-playground-subnet set_name] [--nft-set-isolated set_name] [--nft-set-compat set_name] [--nft-set-gateway set_name] [--nft-set-network set_name] [--nft-set-broadcast set_name] [--nft-set-subnet set_name]... [--hook-file path] [--isolation {on,off,system}]
 ```
 
 <a name="description"></a>
@@ -11,41 +11,33 @@ isodhcp [-i interface] [-s server_ip] [-p pool_cidr] [-d dns_server] [-t lease_t
 # Description
 
 **isodhcp**
-is a lightweight, specialized DHCP server designed for secure Linux
-routers hosting Guest, IoT, or untrusted networks.
+is a specialized DHCP server designed for secure Linux routers hosting guest,
+IoT, or untrusted networks. It prioritizes Layer 3 client isolation and strictly
+controls network topology based on client classification.
+
+It operates in three distinct modes:
+
+**1. Isolated Mode (Standard):**
+The default behavior. Assigns clients a **/32** subnet mask. The server
+injects a specific host route into the kernel for each client. This forces all
+traffic to pass through the gateway, enabling strict isolation.
+
+**2. Micro-Segmentation Mode (Compatibility):**
+For "Legacy" devices that malfunction with /32 masks (e.g., game consoles), the
+server dynamically allocates a tiny **/30** subnet (4 IPs). It creates a
+secondary IP alias on the router interface to serve as the gateway for that
+specific client.
+
+**3. Playground Mode:**
+A reserved, contiguous subnet carved out of the main pool for devices that
+require standard Layer 2 visibility (e.g., Chromecast, Apple TV). Clients in
+the playground share a standard subnet mask (e.g., /26) and can communicate
+with each other, even if global isolation is enforced.
 
 
-Unlike standard DHCP servers, **isodhcp** utilizes an "Unnumbered
-Interface" architecture. It assigns clients a **/32** subnet mask
-(255.255.255.255), forcing all traffic - even traffic destined for
-other devices on the same physical wire - to route through the gateway.
-
-
-Simultaneously, **isodhcp** interacts directly with the Linux kernel using
-**netlink** to inject explicit host routes for every connected client.
-This combination allows the administrator to implement strict layer 3 client
-isolation and granular firewalling (via **NFTables**) on the router,
-effectively treating a shared Ethernet segment as a collection of
-point-to-point links.
-
-
-For legacy clients that lack support for point-to-point **/32** netmasks,
-**isodhcp** can operate in a micro-segmentation mode that helps
-with compatibility problems. For these clients, **isodhcp** dynamically
-carves a **/30** subnet (4 IPs) out of the main pool. It assigns a secondary
-alias IP to the router interface to serve as the gateway for that specific
-client. The client sees a standard broadcast domain, but is effectively
-isolated in its own tiny subnet.
-
-
-Furthermore **isodhcp** can utilize source NAT'ing to make all traffic that
-is directed towards a client look as if it originated from the gateway address
-assigned to that client. This can help with restricted network implementations.
-
-
-The daemon uses raw sockets (via **scapy**) to handle DHCP traffic, bypassing
-standard UDP listeners. It includes built-in rate limiting to prevent DoS
-attacks and manages lease persistence via a JSON file.
+The server features built-in DoS protection (quarantine), ARP conflict
+detection, and robust integration with **nftables** for high-performance
+firewalling.
 
 
 <a name="options"></a>
@@ -57,30 +49,30 @@ attacks and manages lease persistence via a JSON file.
   The DNS server IP address to offer clients. If omitted, the server parses
   _/etc/resolv.conf_ (and systemd-resolved upstream configurations) to find a
   valid IPv4 nameserver.
-
+  
 * **-f** _path_, **--lease-file** _path_  
   Path to the JSON file where lease state is persisted. Defaults to
-  _dhcp\_leases\_\{INTERFACE\}.json_ in the current working directory. The server writes to
+  _dhcp\_leases\_{INTERFACE}.json_ in the current working directory. The server writes to
   this file on allocation, release, and shutdown. To minimize disk wear, renewals
   are only written if the expiration time changes significantly.
-
+  
 * **-i** _interface_, **--interface** _interface_  
   The network interface to listen on (e.g., _eth1_, _wlan0_). The server
   binds specifically to this interface to avoid conflicts with other DHCP servers
   on the host. Defaults to _guest_.
-
+  
 * **-p** _pool_, **--pool** _pool_  
   The CIDR range of IPs to allocate (e.g., _10.100.0.0/24_). If omitted, the
   server attempts to auto-detect the subnet configured on the interface.
-
+  
 * **-s** _server\_ip_, **--server-ip** _server\_ip_  
   The IP address of the router (gateway). If omitted, the server attempts to
   auto-detect the primary IP address assigned to the interface specified
   by **-i**.
-
+  
 * **-t** _seconds_, **--lease-time** _seconds_  
   The duration of the DHCP lease in seconds. Defaults to _3600_ (1 hour).
-
+  
 * **--compat-mac** _mac_  
   Treat the specified MAC address as a "legacy" client. Instead of receiving the
   standard strict **/32** netmask (client isolation), this device will be
@@ -114,29 +106,44 @@ attacks and manages lease persistence via a JSON file.
 * **--masquerade-vendor** _prefix_  
   Apply source NAT to any device that matches this DHCP Vendor Class Identifier.
   
-* **--nft-set-isolated** _name_  
+* **--nft-set-playground** _name_  
   The daemon can populate named **NFTables** sets for integration with
   firewall rules. Each option can only be given once and specifies an
   optional name for a set (e.g., _"inet filter iso\_clients"_). The set will
-  not be created if it doesn't already exist. **--nft-set-isolated** names
-  the set for standard **/32** clients.
+  not be created if it doesn't already exist. **--nft-set-playground** names
+  the set for playground (typically **/24** .. **/29**) clients, that are
+  not isolated from each other.
+  
+* **--nft-set-playground-subnet** _name_  
+  Set for the subnet that contains all playground clients.
+  
+* **--nft-set-isolated** _name_  
+  Set for isolated **/32** clients.
+  
 * **--nft-set-compat** _name_  
   Set for legacy **/30** clients.
+  
 * **--nft-set-gateway** _name_  
   Set for the dynamic gateway IPs created for **/30** blocks.
+  
 * **--nft-set-network** _name_  
   Set for the network addresses of **/30** blocks.
+  
 * **--nft-set-broadcast** _name_  
   Set for the broadcast addresses of **/30** blocks.
+  
 * **--nft-set-subnet** _name_  
-  Set for the CIDR blocks of **/30** allocations. **Note:** This set must have
-  the **interval** flag enabled in **NFTables**.
-* **--static** _mac=ip[,hostname][,compat][,masquerade]_  
+  Set for the CIDR blocks of **/30** allocations. **Note:** This set must
+  have the **interval** flag enabled in **NFTables**.
+  
+* **--static** _mac=ip[,hostname][,compat][,masquerade][,playground]_  
   Map a MAC to a specific IP. Can be repeated.  
   **hostname**: (Optional) string to log for this device.  
   **compat**: (Optional) flag to force this device into legacy or
   compatibility mode.  
   **masquerade**: (Optional) enable source NAT for this client.  
+  playground\R: (Optional) Assign to the shared playground subnet. IP must be
+  within the calculated playground range.  
   **Note:**
   For _compat_ entries, the IP must be the ".2" offset of a valid
   **/30** block (e.g., .2, .6, .10). The server will reserve the entire 4-IP
@@ -144,17 +151,37 @@ attacks and manages lease persistence via a JSON file.
   Static entries are initialized immediately at startup. The server configures the
   interface, routes, and firewall rules before the client even connects. These
   addresses are permanently removed from the free pool.
+  
+* **--dhcp-option** _CODE,TYPE,VALUE_  
+  Inject custom options into DHCP replies.  
+  **TYPE:** _ip_, _ips_ (list), _str_, _int8_, _int16_, _int32_, _hex_.  
+  **VALUE:** The data. For _hex_, colons are optional.
+  
+* **--playground-size** _n_  
+  Number of IPs to reserve. Must be &gt; 5. The server rounds up to the next CIDR
+  boundary (e.g., 50 -&gt; 64 -&gt; /26). If size equals the pool size, the server
+  behaves like a traditional DHCP server (no isolation).
+  
+* **--playground-mac** _mac_  
+  
+* **--playground-oui** _prefix_  
+  
+* **--playground-vendor** _string_  
+  Assign matching clients to the playground. An empty string for vendor matches
+  _all_ clients.
+  
 * **--hook-file** _path_  
   Path to an executable script (e.g., shell or Python) that is invoked whenever a
   lease is added or released. See **HOOK SCRIPT** below for details.
+  
 * **--isolation** _{on,off,system}_  
   In the vast majority of cases, the job of **isodhcp** is done as soon as it
-  sends all traffic through the level 3 router. Policy decisions are supposed to
-  be enforced by a third-party firewall. But sometimes, the situation is easy
-  enough that it only requires minimal firewall rules. In that case, the daemon
-  can be configured to actively block ("on") or actively allow ("off")
-  communication between clients. The default is "system", which leaves the
-  firewall unconfigured.
+  sends all traffic through the layer 3 router. Policy decisions are supposed to
+  be enforced by a third-party firewall. **--isolation** provides minimal
+  built-in firewall support for the **forward** chain policy:  
+  on\R: DROPs intra-subnet traffic except for playground-to-playground.  
+  **off**: ACCEPTs intra-subnet traffic.  
+  **system**: Adds no rules and relies on external firewall.
   
 
 <a name="hook-script"></a>
@@ -163,6 +190,7 @@ attacks and manages lease persistence via a JSON file.
 
 If **--hook-file** is specified, the server executes the script
 asynchronously on lease changes.
+
 
 **Arguments:**  
 $1 = **add** or **del**  
@@ -173,6 +201,9 @@ $4 = Hostname (if available)
 
 **Environment Variables:**
 
+
+* **ISODHCP_MODE**  
+  The client mode: **standard**, **compat**, or **playground**.
 * **ISODHCP_PID**  
   Process ID of the server.
 * **ISODHCP_INTERFACE**  
@@ -195,6 +226,8 @@ $4 = Hostname (if available)
   "1" if Masquerade is enabled for this client, else "0".
 * **ISODHCP_COMPAT**  
   "1" if legacy/compat mode is enabled, else "0".
+* **ISODHCP_EXPIRY**  
+  Lease expiration timestamp (UNIX epoch) or "inf".
 * **ISODHCP_GATEWAY**  
   The specific gateway IP assigned to this client (varies for /30 clients).
 * **ISODHCP_NETMASK**  
@@ -212,13 +245,17 @@ $4 = Hostname (if available)
 * **SIGINT, SIGTERM, SIGHUP**  
   The server catches these signals to perform an orderly shutdown. It flushes the
   current state of all leases to the JSON file before exiting.
+  
 * **SIGUSR1**  
   Reload configuration state. The server will re-scan the in-memory leases and
   re-apply all external system state:
-    * Refresh **NFTables** sets (add missing elements, but don't remove any
+    * \[bu]  
+      Refresh **NFTables** sets (add missing elements, but don't remove any
       extraneous ones if present).
-    * Re-add missing IP aliases to the interface.
-    * Sync kernel routing table (restore missing /32 routes).
+    * \[bu]  
+      Re-add missing IP aliases to the interface.
+    * \[bu]  
+      Sync kernel routing table (restore missing /32 routes).
   
 
 <a name="examples"></a>
@@ -270,10 +307,25 @@ Run on _guest0_. Treat Nintendo Switch (OUI _98:B6:E9_) and Windows XP
 clients as legacy. Assign a static IP to a client that can't handle /32 routes.
 Populate **NFTables** sets for firewalling:
 
-* **isodhcp -i guest0 --compat-oui 98:B6:E9 --compat-vendor "MSFT 5.0" --static 00:11:22:33:44:55=192.168.2.6,compat,masquerade --nft-set-isolated "inet filter client_iso" --nft-set-compat "inet filter client_legacy" --nft-set-gateway "inet filter local_gateways"**
+*     isodhcp -i guest0 &nbsp; --compat-oui 98:B6:E9 &nbsp; --compat-vendor "MSFT 5.0" &nbsp; --static 00:11:22:33:44:55=192.168.2.6,compat,masquerade &nbsp; --nft-set-isolated "inet filter client_iso" &nbsp; --nft-set-compat "inet filter client_legacy" &nbsp; --nft-set-gateway "inet filter local_gateways"
 
 
-**2. Static legacy reservation**  
+**8. Hybrid setup with playground**  
+Run on _guest_. Isolate most clients, but provide a 32-IP playground for
+Nintendo Switch consoles (OUI 98:B6:E9) and Apple TVs (Vendor "tvOS").
+Masquerade the consoles. Advertise an NTP server at "192.168.1.1".
+
+*     isodhcp -i guest --playground-size 32 &nbsp; --playground-oui 98:B6:E9 &nbsp; --playground-vendor "tvOS" &nbsp; --masquerade-oui 98:B6:E9 &nbsp; --dhcp-option "42,ip,192.168.1.1"
+
+
+**9. Unifi controller DHCP option**  
+Send option 43 (vendor specific) to Ubiquiti devices pointing to
+controller 192.168.1.10:
+
+* **isodhcp --dhcp-option 43,hex,01:04:C0:A8:01:0A**
+  
+
+**10. Static legacy reservation**  
 Assign a printer to 10.100.0.10. Force it to use a /30 subnet (occupying
 10.100.0.8/30) because it doesn't support /32:
 
@@ -285,7 +337,7 @@ Assign a printer to 10.100.0.10. Force it to use a /30 subnet (occupying
 # Files
 
 
-* _./dhcp_leases_<INTERFACE>.json_  
+* _./dhcp_leases_{INTERFACE}.json_  
   The default location for lease persistence. Ensure the user running the daemon
   has write permissions to this file (or directory).
   
@@ -297,11 +349,14 @@ Assign a printer to 10.100.0.10. Force it to use a /30 subnet (occupying
 To run **isodhcp** as an unprivileged user, the process requires the
 following Linux capabilities:
 
+
 * **CAP_NET_RAW**  
   Required to open raw sockets for sending/receiving DHCP packets via Scapy.
+  
 * **CAP_NET_ADMIN**  
   Required to modify the kernel routing table (adding/removing /32 routes via
   **netlink**).
+  
 * **CAP_NET_BIND_SERVICE**  
   Required to bind to port 67 (optional, depending on implementation
   details, but recommended).

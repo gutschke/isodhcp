@@ -15,8 +15,8 @@ from scapy.all import *
 from pyroute2 import IPRoute
 from pyroute2.netlink.exceptions import NetlinkError
 
-INTERFACE = "guest"
-LEASE_FILE = "dhcp_leases_{INTERFACE}.json"
+INTERFACE = 'guest'
+LEASE_FILE = 'dhcp_leases_{INTERFACE}.json'
 LEASE_TIME = 3600
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -27,13 +27,16 @@ conf.sniff_promisc = 0
 
 class SystemIntegrator:
     def __init__(self, interface, pool_cidr, isolation_mode='system',
-                 nft_set_iso=None, nft_set_compat=None, nft_set_gw=None,
+                 nft_set_iso=None, nft_set_compat=None, nft_set_playground=None,
+                 nft_set_playground_subnet=None, nft_set_gw=None,
                  nft_set_net=None, nft_set_bcast=None, nft_set_subnet=None):
         self.iface = interface
         self.pool_cidr = pool_cidr
         self.isolation_mode = isolation_mode
         self.nft_iso = nft_set_iso       # e.g. 'inet filter isolated_ips'
         self.nft_compat = nft_set_compat # e.g. 'inet filter compat_ips'
+        self.nft_playground = nft_set_playground
+        self.nft_playground_subnet = nft_set_playground_subnet
         self.nft_gw = nft_set_gw
         self.nft_net = nft_set_net
         self.nft_bcast = nft_set_bcast
@@ -101,14 +104,27 @@ class SystemIntegrator:
         if set_name:
             self.run_cmd(f'nft "flush" element "{set_name}"')
 
-    def update_nft(self, action, ip, is_compat):
-        '''Updates the nftables named set'''
+    def update_client_nft(self, action, ip, mode):
+        '''Updates the nftables named set based on client mode'''
         # action is 'add' or 'delete'
-        target_set = self.nft_compat if is_compat else self.nft_iso
+        target_set = None
+        if mode == ClientClassifier.MODE_PLAYGROUND:
+            target_set = self.nft_playground
+        elif mode == ClientClassifier.MODE_COMPAT:
+            target_set = self.nft_compat
+        elif mode == ClientClassifier.MODE_STANDARD:
+            target_set = self.nft_iso
         if target_set:
             # format: 'table family set_name' provided by user
             # We construct: nft add element inet filter my_set { 10.100.0.50 }
             self.run_cmd(f'nft "{action}" element "{target_set}" "{{ {ip} }}"')
+
+    def update_playground_subnet(self, action, cidr):
+        '''Updates the playground subnet set'''
+        if self.nft_playground_subnet:
+            self.run_cmd(
+                f'nft "{action}" element "{self.nft_playground_subnet}" "{{ '
+                f'{cidr} }}"')
 
     def update_compat_block(self, action, cidr, net_ip, gw_ip, bcast_ip):
         '''Updates all auxiliary sets for a /30 block.'''
@@ -134,23 +150,105 @@ class SystemIntegrator:
         self.run_cmd(f'nft flush chain ip "{self.table_name}" forward')
         self.apply_isolation_policy()
 
-    def apply_isolation_policy(self):
+    def apply_isolation_policy(self, playground_cidr=None):
         '''Applies client-to-client traffic rules based on mode.'''
+        self.run_cmd(f'nft flush chain ip "{self.table_name}" forward')
+        if playground_cidr:
+            match = (f'iifname "{self.iface}" oifname "{self.iface}" '
+                     f'ip saddr "{playground_cidr}" '
+                     f'ip daddr "{playground_cidr}"')
+            self.run_cmd(f'nft add rule ip "{self.table_name}" forward '
+                         f'{match} counter accept')
         match = (f'iifname "{self.iface}" oifname "{self.iface}" '
                  f'ip saddr "{self.pool_cidr}" ip daddr "{self.pool_cidr}"')
-        if self.isolation_mode == 'on':
-            self.run_cmd(f'nft add rule ip "{self.table_name}" forward {match} '
-                         f'counter drop')
-        elif self.isolation_mode == 'off':
-            self.run_cmd(f'nft add rule ip "{self.table_name}" forward {match} '
-                         f'counter accept')
-        else: pass # 'system' mode
 
-    def flush_firewall(self):
+        if self.isolation_mode == 'on':
+            self.run_cmd(f'nft add rule ip "{self.table_name}" forward '
+                         f'{match} counter drop')
+        elif self.isolation_mode == 'off':
+            self.run_cmd(f'nft add rule ip "{self.table_name}" forward '
+                         f'{match} counter accept')
+        # else: system default (usually accept, or handled by other chains)
+
+    def flush_firewall(self, playground_cidr=None):
         self.run_cmd(f'nft flush chain ip "{self.table_name}" postrouting')
-        self.run_cmd(f'nft flush chain ip "{self.table_name}" forward')
         # Re-apply isolation immediately after flush
-        self.apply_isolation_policy()
+        self.apply_isolation_policy(playground_cidr)
+
+class ClientClassifier:
+    '''
+    Centralizes logic for determining client mode (standard, compat, playground)
+    and attributes (masquerade).
+    Precedence: static > MAC > OUI > vendor.
+    Tie-break: compat > playground.
+    '''
+    MODE_PLAYGROUND = 'playground'
+    MODE_STANDARD = 'standard'
+    MODE_COMPAT = 'compat'
+
+    def __init__(self, pg_macs=None, pg_ouis=None, pg_vendors=None,
+                 compat_macs=None, compat_ouis=None, compat_vendors=None,
+                 masq_macs=None, masq_ouis=None, masq_vendors=None,
+                 static_profiles=None):
+        self.pg_macs = pg_macs or set()
+        self.pg_ouis = pg_ouis or set()
+        self.pg_vendors = pg_vendors or set() # Special: '' matches all
+
+        self.compat_macs = compat_macs or set()
+        self.compat_ouis = compat_ouis or set()
+        self.compat_vendors = compat_vendors or set()
+
+        self.masq_macs = masq_macs or set()
+        self.masq_ouis = masq_ouis or set()
+        self.masq_vendors = masq_vendors or set()
+
+        # Static overrides: mac -> {'mode': ..., 'masq': ...}
+        self.static_profiles = static_profiles or {}
+
+    def get_profile(self, mac, pkt):
+        '''Returns a dict: {'mode': MODE_*, 'masq': bool}'''
+        # Static configuration (highest precedence)
+        if mac in self.static_profiles:
+            return self.static_profiles[mac]
+
+        # Dynamic classification
+        is_playground = self.check_match(mac, pkt, self.pg_macs,
+                                          self.pg_ouis, self.pg_vendors)
+
+        is_compat = self.check_match(mac, pkt, self.compat_macs,
+                                     self.compat_ouis, self.compat_vendors)
+
+        is_masq = self.check_match(mac, pkt, self.masq_macs,
+                                   self.masq_ouis, self.masq_vendors)
+
+        # Conflict resolution (compat > playground)
+        mode = self.MODE_STANDARD
+        if is_compat:
+            mode = self.MODE_COMPAT
+        elif is_playground:
+            mode = self.MODE_PLAYGROUND
+
+        return {'mode': mode, 'masq': is_masq}
+
+    def check_match(self, mac, pkt, mac_set, oui_set, vendor_set):
+        if mac in mac_set: return True
+        if len(mac) >= 8 and mac[:8] in oui_set: return True
+        if vendor_set:
+            # If we have an empty string rule, it matches everything
+            if '' in vendor_set: return True
+
+            # Otherwise check packet options
+            if DHCP in pkt:
+                opts = {o[0]: o[1] \
+                        for o in pkt[DHCP].options if isinstance(o, tuple)}
+                vci_bytes = opts.get('vendor_class_id')
+                if vci_bytes:
+                    vci = str(vci_bytes).lower()
+                    # Check partial matches
+                    for pattern in vendor_set:
+                        if pattern and pattern.lower() in vci:
+                            return True
+        return False
 
 class RateLimiter:
     def __init__(self, rate=2.0, burst=5):
@@ -201,7 +299,8 @@ class RateLimiter:
 class LeaseManager:
     def __init__(self, pool_cidr, server_ip, lease_file, lease_time,
                  sys_integrator=None, static_map=None, compat_macs=None,
-                 masq_macs=None, state_change_callback=None):
+                 masq_macs=None, state_change_callback=None,
+                 playground_size=0):
         self.network = ipaddress.IPv4Network(pool_cidr)
         self.server_ip = ipaddress.IPv4Address(server_ip)
         self.lease_file = lease_file
@@ -218,6 +317,12 @@ class LeaseManager:
         self.masq_macs = masq_macs or set()
         self.state_change_callback = state_change_callback
 
+        # Set up a subset of the pool for a playground area
+        self.playground_size = playground_size
+        self.playground_subnet = None
+        self.playground_gateway = None
+        self.playground_free_ips = set()
+
         # In-memory storage
         self.subnet_leases = {} # Track /30 allocations:
                                 # client_mac -> {gateway: ip, subnet: ip}
@@ -232,6 +337,11 @@ class LeaseManager:
             if ip != self.server_ip:
                 self.all_possible_ips.add(str(ip))
         self.free_ips = self.all_possible_ips.copy()
+
+        # Carve out playground
+        if self.playground_size > 0:
+            self.init_playground()
+
         self.load_leases()
         self.reserve_static_ips()
         self.enforce_static_bindings()
@@ -354,6 +464,82 @@ class LeaseManager:
             mode_str = 'compat/30' if is_compat else 'standard/32'
             logger.info(f'📌 Activated static {mode_str}: {ip} for {mac} '
                         f'(masq={is_masq})')
+
+    def init_playground(self):
+        '''
+        Finds a contiguous aligned block for the playground, removing it from
+        the main free_ips pool.
+        '''
+        # Calculate required prefix (e.g., size 64 -> /26)
+        # 32 - log2(64) = 26
+        import math
+        prefix_bits = math.ceil(math.log2(self.playground_size))
+        needed_prefix = 32 - prefix_bits
+
+        # Get candidates (if size=pool, this returns just the pool itself)
+        # We try to allocate from the top of the pool to avoid fragmenting the
+        # bottom (where /30s live). We iterate subnets of the main pool.
+        if needed_prefix < self.network.prefixlen:
+            logger.critical(f'⛔ Playground size {self.playground_size} is '
+                            f'larger than the pool.')
+            sys.exit(1)
+        try:
+            candidate_subnets = \
+                list(self.network.subnets(new_prefix=needed_prefix))
+        except ValueError:
+            logger.critical(f'⛔ Cannot allocate playground of size '
+                            f'{self.playground_size} from {self.network}.')
+            sys.exit(1)
+        candidate_subnets.reverse()
+        found = None
+        for subnet in candidate_subnets:
+            # Valid IPs are those that are free or are the server itself,
+            # which is fine to encompass. We strictly check that we aren't
+            # stomping on existing leases.
+            # First, check for conflicts with active leases (standard/compat)
+            # that might have loaded from disk
+            subnet_set = set(str(ip) for ip in subnet.hosts())
+
+            has_conflict = False
+            for ip in subnet_set:
+                if ip in self.ip_to_mac and ip != str(self.server_ip):
+                    has_conflict = True
+                    break
+            if not has_conflict:
+                found = subnet
+                break
+
+        if not found:
+            logger.critical(f'⛔ Not enough contiguous space for playground '
+                            f'of size {self.playground_size}.')
+            sys.exit(1)
+        self.playground_subnet = found
+
+        # Assign playground gateway (first IP of the block)
+        if self.server_ip in found:
+            self.playground_gateway = str(self.server_ip)
+        else:
+            self.playground_gateway = str(list(found.hosts())[0])
+
+        # Initialize playground free pool
+        for ip_obj in found.hosts():
+            s_ip = str(ip_obj)
+            if s_ip == self.playground_gateway:
+                if s_ip in self.free_ips: self.free_ips.remove(s_ip)
+                continue
+            if s_ip in self.free_ips:
+                self.free_ips.remove(s_ip)
+                self.playground_free_ips.add(s_ip)
+
+        logger.info(f'🎡 Initialized playground: {found} (gw: '
+                    f'{self.playground_gateway})')
+
+        # Add Interface Alias immediately
+        if self.sys:
+            self.sys.add_alias_ip(self.playground_gateway, needed_prefix)
+            self.sys.apply_isolation_policy(str(self.playground_subnet))
+            self.sys.update_playground_subnet(
+                'add', str(self.playground_subnet))
 
     def find_free_slash_30(self):
         '''
@@ -495,6 +681,7 @@ class LeaseManager:
             if mac in self.leases:
                 data = self.leases[mac]
                 ip = data['ip']
+                mode = data.get('mode', ClientClassifier.MODE_STANDARD)
                 is_masq = data.get('masq', False)
                 hostname = data.get('hostname', '')
 
@@ -507,7 +694,7 @@ class LeaseManager:
                     # Tear down router alias
                     if self.sys:
                         self.sys.del_alias_ip(gw_ip, 30)
-                        self.sys.update_nft('delete', ip, is_compat=True)
+                        self.sys.update_client_nft('delete', ip, mode)
                         try:
                             net = ipaddress.IPv4Network(subnet_cidr)
                             blk = [str(x) for x in net]
@@ -523,7 +710,7 @@ class LeaseManager:
                 else:
                     # Standard /32 cleanup
                     if self.sys:
-                        self.sys.update_nft('delete', ip, is_compat=False)
+                        self.sys.update_client_nft('delete', ip, mode)
                     self.free_ips.add(ip)
 
                 # Remove SRCNAT
@@ -631,8 +818,15 @@ class LeaseManager:
         if restored_count > 0:
             logger.info(f'♻️ Released {restored_count} IPs from quarantine.')
 
-    def allocate_or_renew(self, mac, hostname=None, is_compat=False,
-                          is_masq=False):
+    def allocate_or_renew(self, mac, hostname=None, client_profile=None):
+        '''
+        Main logic to determine which IP a client gets. Handles renewals, static
+        mappings, and dynamic allocation strategies.
+        '''
+        if not client_profile: client_profile = {}
+        mode = client_profile.get('mode', ClientClassifier.MODE_STANDARD)
+        is_masq = client_profile.get('masq', False)
+
         with self.cv:
             if self.quarantine:
                 self.process_quarantine_expiry()
@@ -643,10 +837,7 @@ class LeaseManager:
             subnet_info = None
             nft_compat_flag = False
             force_save = True
-
-            was_compat = (mac in self.subnet_leases) or \
-                (mac in self.compat_macs)
-            req_compat = is_compat
+            is_new_lease = True
 
             new_expiry = current_time + self.lease_time
             if mac in self.static_map:
@@ -655,32 +846,40 @@ class LeaseManager:
             # Renewal attempt
             if mac in self.leases:
                 lease = self.leases[mac]
+                old_mode = lease.get('mode', ClientClassifier.MODE_STANDARD)
                 was_masq = lease.get('masq', False)
 
-                if (was_compat != req_compat) or (was_masq != is_masq):
-                    logger.info(f'♻️ Config change for {h}{mac} (compat: '
-                                f'{was_compat}->{req_compat}, masq: '
-                                f'{was_masq}->{is_masq}). Reallocating.')
+                if (old_mode != mode) or (was_masq != is_masq):
+                    logger.info(f'♻️ Config change for {h}{mac} (mode: '
+                                f'{old_mode}->{mode}, masq: {old_masq}->'
+                                f'{is_masq}). Reallocating.')
                     self.release(mac)
                     # Cleared self.leases, and falls through to allocation
                 else:
                     # Successful renewal
                     target_ip = lease['ip']
+                    is_new_lease = False
 
                     # Check optimization to avoid wearing out disk drives with
                     # excessive write operations
-                    if (new_expiry == float('inf') or
-                        current_time + self.lease_time - lease['expires']) < \
-                       (self.lease_time * 0.2):
+                    if new_expiry == float('inf') and \
+                       lease['expires'] == float('inf'):
                         force_save = False
+                    elif new_expiry != float('inf') and \
+                         lease['expires'] != float('inf'):
+                        remaining = lease['expires'] - current_time
+                        if remaining > (self.lease_time * 0.2):
+                            force_save = False
 
                     # Restore topology info for the commit phase
-                    if was_compat:
+                    if mode == ClientClassifier.MODE_COMPAT:
                         sub_data = self.subnet_leases.get(mac)
                         if sub_data:
                             subnet_info = (
                                 sub_data['gateway'], sub_data['subnet'])
                             nft_compat_flag = True
+                    elif mode == ClientClassifier.MODE_PLAYGROUND:
+                        nft_compat_flag = False
                     else:
                         nft_compat_flag = False
 
@@ -690,66 +889,63 @@ class LeaseManager:
                 if mac in self.static_map:
                     static_ip, _ = self.static_map[mac]
 
-                    # Explicitly requested compat mode for statically assigned
-                    # and pre-reserved /30
-                    if mac in self.compat_macs:
+                    if mode == ClientClassifier.MODE_PLAYGROUND:
+                        if self.playground_subnet and \
+                           ipaddress.IPv4Address(static_ip) in \
+                           self.playground_subnet:
+                            target_ip = static_ip
+                            nft_compat_flag = False
+                        else:
+                            logger.error(f'❌ Static IP {static_ip} for {mac} '
+                                         f'is not in the playground subnet.')
+                            return None
+                    elif mode == ClientClassifier.MODE_COMPAT:
+                        # Validate alignment for /30
                         subnet_cidr, gw_ip = \
                             self.check_compat_alignment(static_ip)
-                        target_ip = static_ip
-                        subnet_info = (gw_ip, subnet_cidr)
-                        nft_compat_flag = True
-
-                    # Implicit compat mode (try to upgrade to /30)
-                    elif is_compat:
-                        subnet_cidr, gw_ip = \
-                            self.check_compat_alignment(static_ip)
-
-                        # Check neighbors
-                        neighbors_free = False
                         if subnet_cidr:
-                            block_ips = [
-                                str(x) \
-                                for x in ipaddress.IPv4Network(subnet_cidr)]
-                            if all((ip == static_ip or ip in self.free_ips) \
-                                   for ip in block_ips):
-                                neighbors_free = True
-
-                                # Claim neighbors now
-                                for ip in block_ips:
-                                    if ip in self.free_ips:
-                                        self.free_ips.remove(ip)
-                        if neighbors_free:
                             target_ip = static_ip
                             subnet_info = (gw_ip, subnet_cidr)
                             nft_compat_flag = True
                         else:
-                            # Fallback to standard static
-                            logger.info(f'♻️ Request failed for {h}{mac}. '
-                                        f'Falling back to standard /32 '
-                                        f'allocation')
-                            target_ip = static_ip
-                            nft_compat_flag = False
-                    # Standard static
-                    else:
+                            logger.error(f'❌ Static IP {static_ip} for {mac} '
+                                         f'is not aligned for compat mode.')
+                            return None
+                    else:  # Standard
                         target_ip = static_ip
                         nft_compat_flag = False
-
-                # Dynamic allocation
                 else:
-                    # Dynamically allocate compat /30 address, because
-                    # of matching "--compat-XXX=" flags
-                    if is_compat:
+                    # Playground /24../29
+                    if mode == ClientClassifier.MODE_PLAYGROUND:
+                        if not self.playground_subnet:
+                            logger.error(f'❌ Playground requested by {mac} '
+                                         f'but not configured.')
+                            return None
+                        if self.playground_free_ips:
+                            # Pick any free IP from the playground pool
+                            target_ip = self.playground_free_ips.pop()
+                            nft_compat_flag = False
+                        else:
+                            logger.error(f'❌ Playground pool exhausted.')
+                            return None
+                    # Compat /30
+                    elif mode == ClientClassifier.MODE_COMPAT:
                         subnet = self.find_free_slash_30()
                         if subnet:
-                            blk = [str(x) for x in subnet]
-                            target_ip = blk[2]
-                            subnet_info = (blk[1], str(subnet))
+                            block = [str(x) for x in subnet]
+                            # block=[net, gw, client, bcast]
+                            target_ip = block[2]
+                            subnet_info = (block[1], str(subnet))
                             nft_compat_flag = True
 
                             # Claim IPs
-                            for ip in blk:
-                                self.free_ips.remove(ip)
-
+                            for ip in block:
+                                if ip in self.free_ips:
+                                    self.free_ips.remove(ip)
+                        else:
+                            logger.error(f'❌ No /30 subnets available for '
+                                         f'compat client {mac}.')
+                            return None
                     # Dynamically allocate standard IP address (/32)
                     else:
                         if self.free_ips:
@@ -770,71 +966,70 @@ class LeaseManager:
                                 target_ip = candidate
                                 nft_compat_flag = False
                                 break
-                            if not target_ip:
-                                logger.error('❌ Pool exhausted (or all '
-                                             'candidates busy on wire).')
-                                return None
+                        if not target_ip:
+                            logger.error('❌ Pool exhausted (or all '
+                                         'candidates busy on wire).')
+                            return None
 
             # Commit the new state
-            if not target_ip:
-                logger.error(f'❌ Allocation failed for {h}{mac} (mode: '
-                             f'compat={req_compat})')
-                return None
-
-            # Detect if this is a new allocation or just a renewal
-            is_new_lease = not (mac in self.leases) or \
-                self.leases[mac]['ip'] != target_ip
+            if not target_ip: return None
 
             # Update in-memory leases
             self.leases[mac] = {
                 'ip': target_ip,
                 'expires': new_expiry,
+                'mode': mode,
                 'masq': is_masq
             }
             if hostname:
                 self.leases[mac]['hostname'] = hostname
             self.ip_to_mac[target_ip] = mac
             if subnet_info:
+                # In compat mode we need to store and create the /30 structure
                 self.subnet_leases[mac] = {
                     'gateway': subnet_info[0],
                     'subnet': subnet_info[1]
                 }
 
-            # Update system state
-            if subnet_info:
-                gw_ip, subnet_cidr = subnet_info
-                self.subnet_leases[mac] = {
-                    'gateway': gw_ip, 'subnet': subnet_cidr}
                 if self.sys:
-                    self.sys.add_alias_ip(gw_ip, 30)
+                    self.sys.add_alias_ip(subnet_info[0], 30)
                     try:
-                        blk = [
-                            str(x) for x in ipaddress.IPv4Network(subnet_cidr)]
+                        net = ipaddress.IPv4Network(subnet_info[1])
+                        blk = [str(x) for x in net]
                         self.sys.update_compat_block(
-                            'add', subnet_cidr, blk[0], blk[1], blk[3])
+                            'add', subnet_info[1], blk[0], blk[1], blk[3])
                     except: pass
-            else:
-                # Ensure we clean up any stale subnet info if switching back
-                self.subnet_leases.pop(mac, None)
+                else:
+                    # Clean up is switching away from compat mode
+                    self.subnet_leases.pop(mac, None)
             if self.sys:
-                self.sys.update_nft('add', target_ip, is_compat=nft_compat_flag)
+                self.sys.update_client_nft('add', target_ip, mode)
 
             # Apply masquerading (source NAT)
             if is_masq and self.sys:
-                self.sys.update_snat('add', target_ip,
-                                     subnet_info[0] if subnet_info \
-                                     else str(self.server_ip))
+                gw_ip = str(self.server_ip)
+                if mode == ClientClassifier.MODE_COMPAT and subnet_info:
+                    gw_ip = subnet_info[0]
+                elif mode == ClientClassifier.MODE_PLAYGROUND and \
+                     self.playground_gateway:
+                    gw_ip = self.playground_gateway
+                self.sys.update_snat('add', target_ip, gw_ip)
 
             # Trigger on new allocation or configuration changes, skip renewals.
             if is_new_lease:
                 env = {
+                    'ISODHCP_MODE': mode,
                     'ISODHCP_MASQ': '1' if is_masq else '0',
-                    'ISODHCP_COMPAT': '1' if (mac in self.subnet_leases) else '0',
+                    'ISODHCP_EXPIRY': str(new_expiry)
                 }
-                if mac in self.subnet_leases:
-                    env['ISODHCP_GATEWAY'] = self.subnet_leases[mac]['gateway']
-                    env['ISODHCP_SUBNET'] = self.subnet_leases[mac]['subnet']
+                if mode == ClientClassifier.MODE_COMPAT and subnet_info:
+                    env['ISODHCP_GATEWAY'] = subnet_info[0]
+                    env['ISODHCP_SUBNET'] = subnet_info[1]
                     env['ISODHCP_NETMASK'] = '255.255.255.252'
+                elif mode == ClientClassifier.MODE_PLAYGROUND:
+                    env['ISODHCP_GATEWAY'] = self.playground_gateway
+                    env['ISODHCP_SUBNET'] = str(self.playground_subnet)
+                    env['ISODHCP_NETMASK'] = str(self.playground_subnet.netmask)
                 else:
                     env['ISODHCP_GATEWAY'] = str(self.server_ip)
                     env['ISODHCP_NETMASK'] = '255.255.255.255'
@@ -844,7 +1039,8 @@ class LeaseManager:
             if force_save:
                 self.save_leases()
                 logger.info(f'✨ Lease committed: {target_ip} for {h}{mac} '
-                            f'(compat={nft_compat_flag}, masquerade={is_masq})')
+                            f'(mode={mode}, masquerade={is_masq}, exp='
+                            f'{new_expiry})')
 
             # Recalculate when the next garbage collection cycle should run
             self.cv.notify()
@@ -875,17 +1071,23 @@ class LeaseManager:
             # Flush all managed NFTables sets first. This ensures we don't leave
             # behind manually added entries or stale leases
             for s in [self.sys.nft_iso, self.sys.nft_compat, self.sys.nft_gw,
-                      self.sys.nft_net, self.sys.nft_bcast,
-                      self.sys.nft_subnet]:
+                      self.sys.nft_net, self.sys.nft_bcast, self.sys.nft_subnet,
+                      self.sys.nft_playground, self.sys.nft_playground_subnet]:
                 if s: self.sys.flush_nft_set(s)
 
             # Flush source NAT
-            self.sys.flush_firewall()
+            pg_cidr = str(self.playground_subnet) \
+                if self.playground_subnet else None
+            self.sys.flush_firewall(playground_cidr=pg_cidr)
 
             # Repopulate
+            if self.playground_subnet:
+                self.sys.update_playground_subnet(
+                    'add', str(self.playground_subnet))
             count = 0
             for mac, data in self.leases.items():
                 ip = data['ip']
+                mode = data.get('mode', ClientClassifier.MODE_STANDARD)
 
                 # Check if it is a compat/legacy lease
                 if mac in self.subnet_leases:
@@ -893,16 +1095,13 @@ class LeaseManager:
                     gw = sub['gateway']
                     cidr = sub['subnet']
                     self.sys.add_alias_ip(gw, 30)
-                    self.sys.update_nft('add', ip, is_compat=True)
                     try:
                         net = ipaddress.IPv4Network(cidr)
                         blk = [str(x) for x in net]
                         self.sys.update_compat_block(
                             'add', cidr, blk[0], blk[1], blk[3])
                     except: pass
-                # Standard lease
-                else:
-                    self.sys.update_nft('add', ip, is_compat=False)
+                self.sys.update_client_nft('add', ip, mode)
 
                 if data.get('masq', False):
                     gw = str(self.server_ip)
@@ -915,26 +1114,64 @@ class LeaseManager:
 class UnnumberedDHCPServer:
     def __init__(self, interface, server_ip=None, pool_cidr=None,
                  dns_server=None, lease_time=LEASE_TIME,
-                 lease_file=LEASE_FILE, static_map=None,
+                 lease_file=LEASE_FILE, static_map=None, playground_size=0,
+                 pg_macs=None, pg_ouis=None, pg_vendors=None,
                  compat_macs=None, compat_ouis=None, compat_vendors=None,
                  masq_macs=None, masq_ouis=None, masq_vendors=None,
-                 nft_iso=None, nft_compat=None, nft_gw=None, nft_net=None,
+                 nft_iso=None, nft_compat=None, nft_set_playground=None,
+                 nft_set_playground_subnet=None, nft_gw=None, nft_net=None,
                  nft_bcast=None, nft_subnet=None, hook_file=None,
-                 isolation_mode='system'):
+                 isolation_mode='system', custom_options=None):
         self.iface = interface
         self.lease_time = lease_time
         self.lease_file = lease_file
         self.limiter = RateLimiter(rate=2.0, burst=5)
 
-        # Compatibility configuration
-        self.compat_macs = compat_macs or []
-        self.compat_ouis = set(o.lower() for o in (compat_ouis or []))
-        self.compat_vendors = set(v.lower() for v in (compat_vendors or []))
+        self.pg_macs = pg_macs or set()
+        self.pg_ouis = pg_ouis or set()
+        self.pg_vendors = pg_vendors or set()
 
-        # Masquerading configuration (source NAT)
-        self.masq_macs = masq_macs or []
-        self.masq_ouis = set(o.lower() for o in (masq_ouis or []))
-        self.masq_vendors = set(v.lower() for v in (masq_vendors or []))
+        self.compat_macs = compat_macs or set()
+        self.compat_ouis = compat_ouis or set()
+        self.compat_vendors = compat_vendors or set()
+
+        self.masq_macs = masq_macs or set()
+        self.masq_ouis = masq_ouis or set()
+        self.masq_vendors = masq_vendors or set()
+
+        self.custom_options = custom_options or []
+
+        static_profiles = {}
+        for mac in (static_map or {}):
+            mode = ClientClassifier.MODE_STANDARD
+            if mac in self.compat_macs:
+                mode = ClientClassifier.MODE_COMPAT
+            elif mac in self.pg_macs:
+                mode = ClientClassifier.MODE_PLAYGROUND
+            static_profiles[mac] = {
+                'mode': mode,
+                'masq': (mac in self.masq_macs)
+            }
+
+        self.classifier = ClientClassifier(
+            # Playground
+            pg_macs=self.pg_macs,
+            pg_ouis=self.pg_ouis,
+            pg_vendors=self.pg_vendors,
+
+            # Compatibility configuration
+            compat_macs=self.compat_macs,
+            compat_ouis=self.compat_ouis,
+            compat_vendors=self.compat_vendors,
+
+            # Masquerading configuration (source NAT)
+            masq_macs=self.masq_macs,
+            masq_ouis=self.masq_ouis,
+            masq_vendors=self.masq_vendors,
+
+            # Static profiles
+            static_profiles=static_profiles
+        )
 
         # Detect IP/pool
         if not server_ip or not pool_cidr:
@@ -965,18 +1202,20 @@ class UnnumberedDHCPServer:
 
         self.sys = SystemIntegrator(
             interface, self.pool_cidr, isolation_mode, nft_set_iso=nft_iso,
-            nft_set_compat=nft_compat, nft_set_gw=nft_gw, nft_set_net=nft_net,
-            nft_set_bcast=nft_bcast, nft_set_subnet=nft_subnet)
+            nft_set_compat=nft_compat, nft_set_playground=nft_set_playground,
+            nft_set_playground_subnet=nft_set_playground_subnet,
+            nft_set_gw=nft_gw, nft_set_net=nft_net, nft_set_bcast=nft_bcast,
+            nft_set_subnet=nft_subnet)
 
         # Pass configs to LeaseManager
-        self.compat_macs = compat_macs or set()
         self.lease_mgr = LeaseManager(self.pool_cidr, self.server_ip,
                                       self.lease_file, self.lease_time,
                                       sys_integrator=self.sys,
                                       static_map=static_map,
                                       compat_macs=self.compat_macs,
                                       masq_macs=self.masq_macs,
-                                      state_change_callback=self.execute_hook)
+                                      state_change_callback=self.execute_hook,
+                                      playground_size=playground_size)
 
         # Pre-calculate the "wide" mask (e.g., '255.255.255.0')
         self.wide_netmask = str(self.lease_mgr.network.netmask)
@@ -1307,6 +1546,7 @@ class UnnumberedDHCPServer:
         try:
             if not (DHCP in pkt and pkt[DHCP].options): return
             client_mac = pkt[Ether].src.lower()
+            profile = self.classifier.get_profile(client_mac, pkt)
             if not re.match(r'[0-9a-f]{2}([:][0-9a-f]{2}){5}$', client_mac):
                 logger.warning(f'⚠️ Ignoring packet with invalid MAC: '
                                f'{client_mac}')
@@ -1338,8 +1578,7 @@ class UnnumberedDHCPServer:
             # DHCPDISCOVER (Client needs an IP)
             if msg_type == 1:
                 assigned_ip = self.lease_mgr.allocate_or_renew(
-                    client_mac, hostname=hostname, is_compat=is_compat,
-                    is_masq=is_masq)
+                    client_mac, hostname=hostname, client_profile=profile)
                 if assigned_ip:
                     self.send_reply(pkt, 'offer', assigned_ip, xid, client_mac)
 
@@ -1355,8 +1594,7 @@ class UnnumberedDHCPServer:
                 if current_owner_mac == client_mac:
                     # Confirm allocation (updates timestamp)
                     final_ip = self.lease_mgr.allocate_or_renew(
-                        client_mac, hostname=hostname, is_compat=is_compat,
-                        is_masq=is_masq)
+                        client_mac, hostname=hostname, client_profile=profile)
 
                     # Setup networking
                     self.ensure_route(final_ip, is_compat)
@@ -1416,11 +1654,16 @@ class UnnumberedDHCPServer:
         ]
 
         if msg_type != 'nak':
-            is_compat = self.should_use_wide_mask(old_pkt, mac)
+            lease = self.lease_mgr.leases.get(client_mac)
+            mode = lease.get('mode') \
+                if lease else ClientClassifier.MODE_STANDARD
             router_ip = self.server_ip
             netmask_to_send = '255.255.255.255'
 
-            if is_compat and mac in self.lease_mgr.subnet_leases:
+            if mode == ClientClassifier.MODE_PLAYGROUND:
+                router_ip = self.lease_mgr.playground_gateway
+                netmask_to_send = str(self.lease_mgr.playground_subnet.netmask)
+            elif mode == ClientClassifier.MODE_COMPAT:
                 router_ip = self.lease_mgr.subnet_leases[mac]['gateway']
                 netmask_to_send = '255.255.255.252'
 
@@ -1448,6 +1691,11 @@ class UnnumberedDHCPServer:
                 # with the exact same format. It's safe to send both.
                 (249, opt121),
             ])
+
+            # Inject custom options
+            if self.custom_options:
+                options.extend(self.custom_options)
+
         options.append('end')
 
         yiaddr_val = '0.0.0.0' if msg_type == 'nak' or is_inform else client_ip
@@ -1592,120 +1840,141 @@ class UnnumberedDHCPServer:
         sniff(iface=self.iface, filter='udp and (port 67 or port 68)',
               prn=self.handle_dhcp, store=0)
 
+def parse_custom_options(raw_options):
+    '''Parses CLI options into Scapy-compatible (code, value_bytes) tuples.'''
+    parsed = []
+    if not raw_options: return parsed
+
+    for opt in raw_options:
+        try:
+            parts = opt.split(',', 2)
+            if len(parts) != 3:
+                raise ValueError('Format must be CODE,TYPE,VALUE')
+
+            code = int(parts[0])
+            dtype = parts[1].lower()
+            val = parts[2]
+
+            encoded_val = b''
+
+            if dtype == 'ip':
+                encoded_val = socket.inet_aton(val)
+            elif dtype == 'ips':
+                # Comma-separated list of IPs
+                for ip in val.split(','):
+                    encoded_val += socket.inet_aton(ip.strip())
+            elif dtype == 'str':
+                encoded_val = val.encode('utf-8')
+            elif dtype == 'int8':
+                encoded_val = struct.pack('!B', int(val))
+            elif dtype == 'int16':
+                encoded_val = struct.pack('!H', int(val))
+            elif dtype == 'int32':
+                encoded_val = struct.pack('!I', int(val))
+            elif dtype == 'hex':
+                # Allows raw payload construction (useful for Option 43)
+                encoded_val = bytes.fromhex(val.replace(':', ''). \
+                                            replace(' ', ''))
+            else:
+                raise ValueError(f'Unknown type "{dtype}"')
+
+            parsed.append((code, encoded_val))
+        except Exception as e:
+            logger.critical(f'⛔ Invalid custom option "{opt}": {e}')
+            sys.exit(1)
+    return parsed
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Isolated DHCP Server for Point-To-Point Clients',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument(
         '-d', '--dns',
-        help='DNS Server IP. If omitted, uses system /etc/resolv.conf.'
-    )
-
+        help='DNS Server IP. If omitted, uses system /etc/resolv.conf.')
     parser.add_argument(
         '-f', '--lease-file',
         default=None,
-        help=f'Path to JSON file. Defaults to "{LEASE_FILE}"'
-    )
-
+        help=f'Path to JSON file. Defaults to "{LEASE_FILE}"')
     parser.add_argument(
         '-i', '--interface',
         default=INTERFACE,
-        help='Network interface to bind to'
-    )
-
+        help='Network interface to bind to.')
     parser.add_argument(
         '-p', '--pool',
         help='IP Pool CIDR (e.g., 10.0.0.0/24). If omitted, ' \
-             'auto-detected from interface.'
-    )
-
+             'auto-detected from interface.')
     parser.add_argument(
         '-s', '--server-ip',
-        help='Static Server IP. If omitted, auto-detected from interface.'
-    )
-
+        help='Static Server IP. If omitted, auto-detected from interface.')
     parser.add_argument(
-        '-t', '--lease-time',
-        type=int,
-        default=LEASE_TIME,
-        help='DHCP Lease time in seconds.'
-    )
-
+        '-t', '--lease-time', type=int, default=LEASE_TIME,
+        help='DHCP Lease time in seconds.')
     parser.add_argument(
-        '--compat-mac',
-        action='append',
-        help='Treat this MAC as legacy (send wide netmask). Can be repeated.'
-    )
-
+        '--playground-size', type=int, default=0, help='Size of shared pool. '
+        'Behaves like a traditional DHCP server without layer 3 isolation.')
     parser.add_argument(
-        '--compat-oui',
-        action='append',
-        help='Treat this MAC prefix (e.g. "00:11:22") as legacy. Can be ' \
-             'repeated.'
-    )
-
+        '--playground-mac', action='append',
+        help='Treat this MAC as part of the playground. Can be repeated.')
     parser.add_argument(
-        '--compat-vendor',
-        action='append',
-        help='Treat clients with this Vendor ID string (option 60) as ' \
-             'legacy. e.g. "MSFT 5.0"'
-    )
-
+        '--playground-oui', action='append', help='Treat this MAC prefix (e.g. '
+        '"00:11:22") as part of the playground. Can be repeated.')
     parser.add_argument(
-        '--masquerade-mac',
-        action='append',
-        help='Masquerade incoming traffic to originate from gateway IP. ' \
-             'Can be repeated.'
-    )
-
+        '--playground-vendor', action='append', help='Treat clients with this '
+        'Vendor ID string (option 60) as part of the playground. An empty '
+        'argument is treated as a wild-card matching every client. Can be '
+        'repeated.')
     parser.add_argument(
-        '--masquerade-oui',
-        action='append',
-        help='Treat this MAC prefix (e.g. "00:11:22") as masqueraded. Can be ' \
-             'repeated.'
-    )
-
+        '--compat-mac', action='append', help='Treat this MAC as legacy (send '
+        'wide /30 netmask). Can be repeated.')
     parser.add_argument(
-        '--masquerade-vendor',
-        action='append',
-        help='Treat clients with this Vendor ID string (option 60) as ' \
-             'masqueraded. e.g. "MSFT 5.0"'
-    )
-
+        '--compat-oui', action='append', help='Treat this MAC prefix (e.g. '
+        '"00:11:22") as legacy. Can be repeated.')
     parser.add_argument(
-        '--static',
-        action='append',
-        help='Map a MAC to an IP. Format: --static aa:bb:cc:dd:ee:ff=' \
-             '10.100.0.50{,hostname}{,compat}{,masquerade}'
-    )
-
+        '--compat-vendor', action='append', help='Treat clients with this '
+        'Vendor ID string (option 60) as legacy. e.g. "MSFT 5.0". An empty '
+        'argument is treated as a wild-card matching every client. Can be '
+        'repeated.')
+    parser.add_argument(
+        '--masquerade-mac', action='append', help='Masquerade incoming traffic '
+        'to originate from gateway IP. Can be repeated.')
+    parser.add_argument(
+        '--masquerade-oui', action='append', help='Treat this MAC prefix (e.g. '
+        '"00:11:22") as masqueraded. Can be repeated.')
+    parser.add_argument(
+        '--masquerade-vendor', action='append', help='Treat clients with this '
+        'Vendor ID string (option 60) as masqueraded. e.g. "MSFT 5.0". An '
+        'empty argument is treated as a wild-card matching every client. Can '
+        'be repeated.')
+    parser.add_argument(
+        '--static', action='append', help='Map a MAC to an IP. Format: '
+        '--static aa:bb:cc:dd:ee:ff=10.100.0.50{,hostname}{,compat}'
+        '{,masquerade}{,playground}')
     parser.add_argument('--nft-set-isolated',
                         help='NFTables set for isolated clients')
-
     parser.add_argument('--nft-set-compat',
                         help='NFTables set for legacy clients in '
                         'compatibility mode')
-
+    parser.add_argument('--nft-set-playground',
+                        help='NFTables set for playground clients')
+    parser.add_argument('--nft-set-playground-subnet',
+                        help='NFTables set for the playground subnet CIDR')
     parser.add_argument('--nft-set-gateway',
                         help='NFTables set for compatibility gateway IPs')
-
     parser.add_argument('--nft-set-network',
                         help='NFTables set for compatibility network IPs')
-
     parser.add_argument('--nft-set-broadcast',
                         help='NFTables set for compatibility broadcast IPs')
-
     parser.add_argument('--nft-set-subnet',
                         help='NFTables set for compatibility /30 subnets')
-
     parser.add_argument('--hook-file', help='Path to executable script '
                         'triggered on lease add/del')
-
     parser.add_argument('--isolation', choices=['on', 'off', 'system'],
                         default='system',
                         help='Enforce client-to-client isolation policy')
+    parser.add_argument(
+        '--dhcp-option', action='append', help='Add custom DHCP option. '
+        'Format: CODE,TYPE,VALUE. Types: ip, ips, str, int8, int16, int32, '
+        'hex. Example: --dhcp-option "42,ip,192.168.1.1"')
 
     args = parser.parse_args()
 
@@ -1739,10 +2008,22 @@ if __name__ == '__main__':
     signal.signal(signal.SIGHUP, graceful_exit)
     signal.signal(signal.SIGUSR1, handle_reload)
 
-    # Parse static maps
-    static_map = {}
-    compat_macs = set(m.lower() for m in (args.compat_mac or []))
-    masq_macs = set(m.lower() for m in (args.masquerade_mac or []))
+    def clean_set(items):
+        if not items: return set()
+        return set(str(i).strip().lower() for i in items)
+
+    # Normalize command line list
+    pg_macs = clean_set(args.playground_mac)
+    pg_ouis = clean_set(args.playground_oui)
+    pg_vendors = clean_set(args.playground_vendor)
+
+    compat_macs = clean_set(args.compat_mac)
+    compat_ouis = clean_set(args.compat_oui)
+    compat_vendors = clean_set(args.compat_vendor)
+
+    masq_macs = clean_set(args.masquerade_mac)
+    masq_ouis = clean_set(args.masquerade_oui)
+    masq_vendors = clean_set(args.masquerade_vendor)
 
     static_map = {}
     if args.static:
@@ -1751,14 +2032,15 @@ if __name__ == '__main__':
                 parts = item.split('=')
                 if len(parts) != 2:
                     raise ValueError('Format must be MAC=IP{,hostname}'
-                                     '{,compat}{,masquerade}')
+                                     '{,compat}{,masquerade}{,playground}')
                 mac = parts[0].strip().lower()
                 val = parts[1].strip().split(',')
                 ip = val[0].strip().lower()
                 hostname = None
                 for flag in val[1:]:
                     f = flag.strip().lower()
-                    if f == 'compat': compat_macs.add(mac)
+                    if f == 'playground': pg_macs.add(mac)
+                    elif f == 'compat': compat_macs.add(mac)
                     elif f == 'masquerade': masq_macs.add(mac)
                     elif f and not hostname: hostname = f
                     else: raise ValueError('Format must be MAC=IP{,hostname}'
@@ -1766,13 +2048,25 @@ if __name__ == '__main__':
 
                 # Basic validation
                 if not re.match(r'[0-9a-f]{2}([:][0-9a-f]{2}){5}$', mac):
-                    logger.error(f'⚠️ Invalid MAC in static map: {mac}')
-                    sys.exit(1)
+                    raise ValueError(f'⚠️ Invalid MAC in static map: {mac}')
                 ipaddress.IPv4Address(ip) # Check if valid IP
+                if (mac in pg_macs) and (mac in compat_macs):
+                    raise ValueError(f'MAC {mac} cannot be both "compat" and '
+                                     f'"playground".')
                 static_map[mac] = (ip, hostname)
             except Exception as e:
                 logger.critical(f'⚠️ Failed to parse static map "{item}": {e}')
                 sys.exit(1)
+
+    # Validate playground size
+    if args.playground_size > 0:
+        if args.playground_size <= 5:
+             logger.critical(f'⚠️ Playground size must be > 5 for a minimum '
+                             f'allocation of 8 IPs.')
+             sys.exit(1)
+
+    # Parse custom DHCP options
+    custom_options = parse_custom_options(args.dhcp_option)
 
     # Pass parsed arguments to the server constructor
     server = None
@@ -1785,20 +2079,27 @@ if __name__ == '__main__':
             lease_time=args.lease_time,
             lease_file=lease_file,
             static_map=static_map,
+            playground_size=args.playground_size,
+            pg_macs=pg_macs,
+            pg_ouis=pg_ouis,
+            pg_vendors=pg_vendors,
             compat_macs=compat_macs,
-            compat_ouis=args.compat_oui,
-            compat_vendors=args.compat_vendor,
+            compat_ouis=compat_ouis,
+            compat_vendors=compat_vendors,
             masq_macs=masq_macs,
-            masq_ouis=args.masquerade_oui,
-            masq_vendors=args.masquerade_vendor,
+            masq_ouis=masq_ouis,
+            masq_vendors=masq_vendors,
             nft_iso=args.nft_set_isolated,
             nft_compat=args.nft_set_compat,
+            nft_set_playground=args.nft_set_playground,
+            nft_set_playground_subnet=args.nft_set_playground_subnet,
             nft_gw=args.nft_set_gateway,
             nft_net=args.nft_set_network,
             nft_bcast=args.nft_set_broadcast,
             nft_subnet=args.nft_set_subnet,
             hook_file=args.hook_file,
-            isolation_mode=args.isolation
+            isolation_mode=args.isolation,
+            custom_options=custom_options
         )
         server.start()
     except (KeyboardInterrupt, SystemExit):
