@@ -851,7 +851,7 @@ class LeaseManager:
 
                 if (old_mode != mode) or (was_masq != is_masq):
                     logger.info(f'♻️ Config change for {h}{mac} (mode: '
-                                f'{old_mode}->{mode}, masq: {old_masq}->'
+                                f'{old_mode}->{mode}, masq: {was_masq}->'
                                 f'{is_masq}). Reallocating.')
                     self.release(mac)
                     # Cleared self.leases, and falls through to allocation
