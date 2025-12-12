@@ -59,7 +59,7 @@ sudo ./install.sh
 ```
 
 During installation, you will be prompted to choose an installation directory
-(default: /usr/local/lib/isodhcp).
+(default: `/usr/local/lib/isodhcp`).
 
 ## Dependencies
 * Python 3.6+
@@ -85,14 +85,17 @@ sudo vi /usr/local/lib/isodhcp/isodhcp.service
     --pool 10.100.0.0/24 \
     --dns 1.1.1.1 \
     --playground-size 32 \
+    --playground-vendor "tvOS" \
     --nft-set-isolated "inet filter client_iso" \
     --compat-oui "98:B6:E9"  # Nintendo Switch
 ```
 
-Once configured, start the service:
+Once configured, start the service and inspect its log messages:
 
 ```bash
-sudo systemctl start isodhcp
+sudo systemctl daemon-reload
+sudo systemctl restart isodhcp
+sudo journalctl -xeu isodhcp
 ```
 
 ## Documentation
@@ -113,3 +116,6 @@ To remove the service, user, and files:
 ```bash
 sudo ./uninstall.sh
 ```
+
+This file can also be found in the installation directory (e.g.
+`/usr/local/lib/isodhcp/uninstall.sh`)
