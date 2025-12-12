@@ -249,13 +249,10 @@ $4 = Hostname (if available)
 * **SIGUSR1**  
   Reload configuration state. The server will re-scan the in-memory leases and
   re-apply all external system state:
-    * \[bu]  
-      Refresh **NFTables** sets (add missing elements, but don't remove any
+    * Refresh **NFTables** sets (add missing elements, but don't remove any
       extraneous ones if present).
-    * \[bu]  
-      Re-add missing IP aliases to the interface.
-    * \[bu]  
-      Sync kernel routing table (restore missing /32 routes).
+    * Re-add missing IP aliases to the interface.
+    * Sync kernel routing table (restore missing /32 routes).
   
 
 <a name="examples"></a>

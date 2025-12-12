@@ -324,12 +324,12 @@ current state of all leases to the JSON file before exiting.
 Reload configuration state. The server will re-scan the in-memory leases and
 re-apply all external system state:
 .RS
-.IP \[bu] 2
+.IP \- 2
 Refresh \fBNFTables\fR sets (add missing elements, but don't remove any
 extraneous ones if present).
-.IP \[bu] 2
+.IP \- 2
 Re-add missing IP aliases to the interface.
-.IP \[bu] 2
+.IP \- 2
 Sync kernel routing table (restore missing /32 routes).
 .RE
 
