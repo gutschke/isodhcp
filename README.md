@@ -55,7 +55,8 @@ environment, installs dependencies (`pyroute2`, `scapy`), and configures
 
 ```bash
 # Install (requires root)
-sudo ./install.sh```
+sudo ./install.sh
+```
 
 During installation, you will be prompted to choose an installation directory
 (default: /usr/local/lib/isodhcp).
@@ -73,7 +74,8 @@ daemon. After installation, edit the `systemd` service file to match your
 network topology:
 
 ```bash
-sudo vi /usr/local/lib/isodhcp/isodhcp.service```
+sudo vi /usr/local/lib/isodhcp/isodhcp.service
+```
 
 ## Example Configuration:
 
@@ -84,12 +86,14 @@ sudo vi /usr/local/lib/isodhcp/isodhcp.service```
     --dns 1.1.1.1 \
     --playground-size 32 \
     --nft-set-isolated "inet filter client_iso" \
-    --compat-oui "98:B6:E9"  # Nintendo Switch```
+    --compat-oui "98:B6:E9"  # Nintendo Switch
+```
 
 Once configured, start the service:
 
 ```bash
-sudo systemctl start isodhcp```
+sudo systemctl start isodhcp
+```
 
 ## Documentation
 For a complete reference of all command-line options, signal handling, and
@@ -100,10 +104,12 @@ hook script environment variables, please refer to the manual page:
 Or, after installation:
 
 ```bash
-man isodhcp```
+man isodhcp
+```
 
 ## Uninstalling
 To remove the service, user, and files:
 
 ```bash
-sudo ./uninstall.sh```
+sudo ./uninstall.sh
+```
