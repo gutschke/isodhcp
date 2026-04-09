@@ -53,34 +53,28 @@ class SystemIntegrator:
             pass # Be resilient to errors (e.g. deleting non-existent entry)
 
     def update_snat(self, action, client_ip, gateway_ip):
-        '''Adds or removes a source NAT rule. Deletion is handled by finding the
-        rule handle first.'''
+        '''Adds or removes source NAT rules. Ensures no duplicate rules exist.'''
+        # Always attempt to clean up existing rules for this client IP first
+        try:
+            result = subprocess.run(
+                ['nft', '-a', 'list', 'chain', 'ip', self.table_name,
+                 'postrouting'], capture_output=True, text=True, check=True)
+            # Find all handles for this specific client_ip
+            pattern = re.compile(
+                rf'ip\s+daddr\s+{re.escape(client_ip)}\s+.*handle\s+(\d+)')
+            handles = pattern.findall(result.stdout)
+
+            for handle in handles:
+                self.run_cmd(f'nft delete rule ip "{self.table_name}" '
+                             f'postrouting handle "{handle}"')
+        except Exception:
+            pass
+
         if action == 'add':
             self.run_cmd(f'nft add rule ip "{self.table_name}" postrouting '
                          f'oifname "{self.iface}" ip daddr "{client_ip}" '
                          f'ip saddr != "{self.pool_cidr}" '
                          f'counter snat to "{gateway_ip}"')
-        elif action == 'delete':
-            try:
-                # List the chain with handles (-a)
-                result = subprocess.run(
-                    ['nft', '-a', 'list', 'chain', 'ip', self.table_name,
-                     'postrouting'], capture_output=True, text=True, check=True)
-                pattern = re.compile(
-                    rf'ip\s+daddr\s+{re.escape(client_ip)}\s+.*handle\s+(\d+)')
-
-                match = pattern.search(result.stdout)
-                if match:
-                    handle = match.group(1)
-                    # Delete by handle
-                    del_cmd = (f'nft delete rule ip "{self.table_name}" '
-                               f'postrouting handle "{handle}"')
-                    self.run_cmd(del_cmd)
-                else:
-                    # Rule not found? That's fine, job done.
-                    pass
-            except:
-                pass
 
     def add_alias_ip(self, ip, cidr):
         '''Adds a secondary IP to the interface (for /30 gateways)'''
