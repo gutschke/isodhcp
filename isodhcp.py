@@ -323,6 +323,7 @@ class LeaseManager:
         self.leases = {}     # MAC -> {'ip': str, 'expires': float,
                              #         'hostname': str (opt) }
         self.quarantine = {}
+        self._quarantine_alerted = False  # one-shot alert when the cap is reached
         self.ip_to_mac = {}  # IP -> MAC
 
         # Calculate free IPs
@@ -331,6 +332,10 @@ class LeaseManager:
             if ip != self.server_ip:
                 self.all_possible_ips.add(str(ip))
         self.free_ips = self.all_possible_ips.copy()
+        # Bound the quarantine so a device that DECLINE-floods or ARP-claims many pool IPs
+        # cannot pin the whole pool out of service. At least half the pool is always kept
+        # allocatable; reaching the cap raises a loud one-shot alert.
+        self.quarantine_cap = max(16, len(self.all_possible_ips) // 2)
 
         # Carve out playground
         if self.playground_size > 0:
@@ -756,6 +761,26 @@ class LeaseManager:
         except: pass
         return False
 
+    def _quarantine(self, ip, until):
+        '''Quarantine `ip` until `until`, capped so a misbehaving or hostile device cannot
+        pin the whole pool out of service (a DECLINE flood, or ARP-claiming pool IPs). An
+        already-quarantined IP is always updatable (extending its sentence costs nothing);
+        a NEW entry is refused once the cap is reached, and the operator is alerted once.
+        Caller must hold self.lock. Returns True if `ip` is (now) quarantined, else False.'''
+        if ip in self.quarantine:
+            self.quarantine[ip] = until
+            return True
+        if len(self.quarantine) >= self.quarantine_cap:
+            if not self._quarantine_alerted:
+                logger.error(f'🚨 Quarantine cap reached ({self.quarantine_cap} of '
+                             f'{len(self.all_possible_ips)} pool IPs). Refusing to pin '
+                             f'more — possible DECLINE flood or ARP spoofing on the '
+                             f'segment. The pool stays allocatable; investigate.')
+                self._quarantine_alerted = True
+            return False
+        self.quarantine[ip] = until
+        return True
+
     def decline_ip(self, mac, ip):
         '''Handles DHCPDECLINE. Revokes lease and quarantines IP.'''
         with self.lock:
@@ -767,11 +792,10 @@ class LeaseManager:
                 return
             if current_owner == mac:
                 self.release(mac)
-            if ip in self.free_ips:
-                self.free_ips.remove(ip)
-            logger.warning(f'⚠️ Received DECLINE for {ip} from {mac}. '
-                           f'Quarantining for 10 min.')
-            self.quarantine[ip] = time.time() + 600
+            if self._quarantine(ip, time.time() + 600):
+                self.free_ips.discard(ip)
+                logger.warning(f'⚠️ Received DECLINE for {ip} from {mac}. '
+                               f'Quarantining for 10 min.')
 
     def process_quarantine_expiry(self):
         '''Lazy cleanup: Checks expired quarantine entries.
@@ -799,8 +823,8 @@ class LeaseManager:
         restored_count = 0
         for ip in expired_ips:
             if ip in active_on_wire:
-                # Still active? Extend sentence by 5 mins
-                self.quarantine[ip] = now + 300
+                # Still active? Extend sentence by 5 mins (already counted, never capped).
+                self._quarantine(ip, now + 300)
             else:
                 # Quiet? Release.
                 del self.quarantine[ip]
@@ -808,6 +832,10 @@ class LeaseManager:
                 if ip in self.all_possible_ips and ip not in self.ip_to_mac:
                     self.free_ips.add(ip)
                     restored_count += 1
+
+        # Re-arm the cap alert once the quarantine has drained back under the cap.
+        if self._quarantine_alerted and len(self.quarantine) < self.quarantine_cap:
+            self._quarantine_alerted = False
 
         if restored_count > 0:
             logger.info(f'♻️ Released {restored_count} IPs from quarantine.')
@@ -954,8 +982,10 @@ class LeaseManager:
                                 if self.is_ip_active_in_arp(candidate):
                                     logger.warning(f'⚠️ IP {candidate} is free '
                                                    f'in DB but active on wire!')
-                                    self.quarantine[candidate] = \
-                                        current_time + 300
+                                    if not self._quarantine(candidate,
+                                                            current_time + 300):
+                                        # Cap hit: don't leak it, return to the pool.
+                                        self.free_ips.add(candidate)
                                     continue
                                 target_ip = candidate
                                 nft_compat_flag = False
