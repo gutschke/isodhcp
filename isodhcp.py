@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import socket
 import struct
@@ -46,11 +47,23 @@ class SystemIntegrator:
         self.init_firewall()
 
     def run_cmd(self, cmd):
+        # Tokenize with shlex and run WITHOUT a shell. The command strings quote
+        # multi-word arguments (e.g. "inet filter isolated_ips" or "{ 10.0.0.1 }")
+        # so shlex groups them exactly as the shell would have, and nft/ip re-lex
+        # the reconstructed line. Dropping the shell removes any chance of a value
+        # being interpreted as a metacharacter.
         try:
-            subprocess.run(cmd, shell=True, check=True,
+            argv = shlex.split(cmd)
+            if not argv:
+                return
+            subprocess.run(argv, check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except subprocess.CalledProcessError:
             pass # Be resilient to errors (e.g. deleting non-existent entry)
+        except ValueError as e:
+            # shlex failed to tokenize (unbalanced quote). Never fall back to a
+            # shell; just log and move on.
+            logger.error(f'⚠️ Skipped malformed command: {e}')
 
     def update_snat(self, action, client_ip, gateway_ip):
         '''Adds or removes source NAT rules. Ensures no duplicate rules exist.'''
@@ -79,16 +92,9 @@ class SystemIntegrator:
     def add_alias_ip(self, ip, cidr):
         '''Adds a secondary IP to the interface (for /30 gateways)'''
         # cmd: ip addr add 10.100.0.5/30 dev eth1
-        cmd = f'ip addr add "{ip}/{cidr}" dev "{self.iface}"'
-        try:
-            subprocess.run(cmd, shell=True, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError as e:
-            # Exit code 2 usually means "exists" in iproute2
-            if e.returncode != 0:
-                # We can verify existence if we really want, but for now
-                # assuming it's fine
-                pass
+        # run_cmd swallows the non-zero exit iproute2 returns when the alias
+        # already exists, which is exactly the behaviour we want here.
+        self.run_cmd(f'ip addr add "{ip}/{cidr}" dev "{self.iface}"')
 
     def del_alias_ip(self, ip, cidr):
         self.run_cmd(f'ip addr del "{ip}/{cidr}" dev "{self.iface}"')
@@ -245,11 +251,32 @@ class ClientClassifier:
         return False
 
 class RateLimiter:
-    def __init__(self, rate=2.0, burst=5):
+    def __init__(self, rate=2.0, burst=5, max_clients=65536):
         self.rate = rate          # Tokens added per second
         self.burst = burst        # Maximum bucket size
+        # Hard cap on tracked MACs. A guest spoofing a flood of random source
+        # MACs would otherwise grow this dict without bound (one entry per MAC)
+        # long before the hourly cleanup runs, so cap it and fail closed.
+        self.max_clients = max_clients
         self.clients = {}         # MAC -> {tokens: float, last_update: float}
         self.lock = threading.Lock()
+        self._full_alerted = False  # one-shot alert when the table saturates
+        self._last_prune = 0.0      # throttles the inline prune when saturated
+
+    def _prune(self, now):
+        '''Drop clients idle for over an hour. Caller must hold self.lock.'''
+        self._last_prune = now
+        stale_macs = [
+            mac for mac,
+            data in self.clients.items()
+            if (now - data['last_update']) > 3600
+        ]
+        for mac in stale_macs:
+            self.clients.pop(mac, None)
+        if stale_macs:
+            logger.debug(f'🧹 RateLimiter cleaned up {len(stale_macs)} '
+                         f'stale MACs')
+        return len(stale_macs)
 
     def is_allowed(self, mac):
         now = time.time()
@@ -257,6 +284,25 @@ class RateLimiter:
         with self.lock:
             # Initialize new client
             if mac not in self.clients:
+                # Bound memory: if the table is full, try an inline prune of
+                # idle entries first; if it is still full it is saturated with
+                # active abusers, so drop this packet rather than risk an OOM.
+                if len(self.clients) >= self.max_clients:
+                    # Throttle the scan. Under a sustained new-MAC flood every
+                    # entry is fresh, so a prune frees nothing; rescanning the
+                    # whole table on every packet would just turn the averted
+                    # memory DoS into a CPU one. Rescan at most once a second and
+                    # otherwise fail closed immediately.
+                    if now - self._last_prune >= 1.0:
+                        self._prune(now)
+                    if len(self.clients) >= self.max_clients:
+                        if not self._full_alerted:
+                            logger.error(
+                                f'🚨 RateLimiter table full '
+                                f'({self.max_clients} MACs). Dropping packets '
+                                f'from new MACs — possible source-MAC flood.')
+                            self._full_alerted = True
+                        return False
                 self.clients[mac] = {
                     'tokens': self.burst - 1,
                     'last_update': now
@@ -278,17 +324,11 @@ class RateLimiter:
         '''Periodically remove old clients to save RAM'''
         now = time.time()
         with self.lock:
-            # Remove clients we haven't seen in 1 hour
-            stale_macs = [
-                mac for mac,
-                data in self.clients.items()
-                if (now - data['last_update']) > 3600
-            ]
-            for mac in stale_macs:
-                self.clients.pop(mac, None)
-            if stale_macs:
-                logging.debug(f'🧹 RateLimiter cleaned up {len(stale_macs)} '
-                              f'stale MACs')
+            self._prune(now)
+            # Re-arm the saturation alert once the table has real headroom, so a
+            # future flood alerts again without spamming while one is ongoing.
+            if self._full_alerted and len(self.clients) < self.max_clients * 0.9:
+                self._full_alerted = False
 
 class LeaseManager:
     def __init__(self, pool_cidr, server_ip, lease_file, lease_time,
@@ -1660,6 +1700,18 @@ class UnnumberedDHCPServer:
             elif msg_type == 8:
                 client_ip = pkt[BOOTP].ciaddr
                 if client_ip == '0.0.0.0': return
+                # Only answer for an address inside our managed pool. This keeps
+                # the server from being coaxed into emitting a unicast reply
+                # aimed at an arbitrary off-pool ciaddr.
+                try:
+                    in_pool = ipaddress.IPv4Address(client_ip) in \
+                        self.lease_mgr.network
+                except ValueError:
+                    in_pool = False
+                if not in_pool:
+                    logger.warning(f'⚠️ Ignoring INFORM from {client_mac} for '
+                                   f'out-of-pool IP {client_ip}')
+                    return
                 logger.info(f'ℹ️ Received INFORM from {client_ip} '
                             f'({client_mac})')
                 self.send_reply(pkt, 'ack', client_ip, xid, client_mac,
@@ -1678,25 +1730,31 @@ class UnnumberedDHCPServer:
         ]
 
         if msg_type != 'nak':
-            lease = self.lease_mgr.leases.get(client_mac)
-            mode = lease.get('mode') \
-                if lease else ClientClassifier.MODE_STANDARD
+            # Read a consistent (mode, gateway, netmask) snapshot under the lease
+            # lock; the garbage-collector thread can release a lease and tear down
+            # its subnet_leases entry concurrently, and we don't want to build a
+            # reply from half-updated state. sendp() stays outside the lock.
             router_ip = self.server_ip
             netmask_to_send = '255.255.255.255'
+            with self.lease_mgr.lock:
+                lease = self.lease_mgr.leases.get(client_mac)
+                mode = lease.get('mode') \
+                    if lease else ClientClassifier.MODE_STANDARD
 
-            if mode == ClientClassifier.MODE_PLAYGROUND:
-                router_ip = self.lease_mgr.playground_gateway
-                netmask_to_send = str(self.lease_mgr.playground_subnet.netmask)
-            elif mode == ClientClassifier.MODE_COMPAT:
-                # Use THIS client's /30 gateway. (Previously referenced a bare
-                # `mac` that resolved to a stale module-global, so every compat
-                # client was handed the last static client's gateway.) Guard the
-                # lookup so a missing entry falls back to the server route
-                # instead of crashing the reply path.
-                sub = self.lease_mgr.subnet_leases.get(client_mac)
-                if sub:
-                    router_ip = sub['gateway']
-                    netmask_to_send = '255.255.255.252'
+                if mode == ClientClassifier.MODE_PLAYGROUND:
+                    router_ip = self.lease_mgr.playground_gateway
+                    netmask_to_send = \
+                        str(self.lease_mgr.playground_subnet.netmask)
+                elif mode == ClientClassifier.MODE_COMPAT:
+                    # Use THIS client's /30 gateway. (Previously referenced a bare
+                    # `mac` that resolved to a stale module-global, so every
+                    # compat client was handed the last static client's gateway.)
+                    # Guard the lookup so a missing entry falls back to the server
+                    # route instead of crashing the reply path.
+                    sub = self.lease_mgr.subnet_leases.get(client_mac)
+                    if sub:
+                        router_ip = sub['gateway']
+                        netmask_to_send = '255.255.255.252'
 
             opt121 = b'\x00' + socket.inet_aton(router_ip)
 
