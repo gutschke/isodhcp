@@ -1688,8 +1688,15 @@ class UnnumberedDHCPServer:
                 router_ip = self.lease_mgr.playground_gateway
                 netmask_to_send = str(self.lease_mgr.playground_subnet.netmask)
             elif mode == ClientClassifier.MODE_COMPAT:
-                router_ip = self.lease_mgr.subnet_leases[mac]['gateway']
-                netmask_to_send = '255.255.255.252'
+                # Use THIS client's /30 gateway. (Previously referenced a bare
+                # `mac` that resolved to a stale module-global, so every compat
+                # client was handed the last static client's gateway.) Guard the
+                # lookup so a missing entry falls back to the server route
+                # instead of crashing the reply path.
+                sub = self.lease_mgr.subnet_leases.get(client_mac)
+                if sub:
+                    router_ip = sub['gateway']
+                    netmask_to_send = '255.255.255.252'
 
             opt121 = b'\x00' + socket.inet_aton(router_ip)
 
@@ -1734,7 +1741,7 @@ class UnnumberedDHCPServer:
         )
         sendp(reply, iface=self.iface, verbose=False)
         log_type = 'INFORM_ACK' if is_inform else msg_type.upper()
-        logger.info(f'📤 Sent {log_type} to {client_ip} ({mac})')
+        logger.info(f'📤 Sent {log_type} to {client_ip} ({client_mac})')
 
     def get_system_dns(self):
         '''
