@@ -267,6 +267,25 @@ class ClientClassifier:
                             return True
         return False
 
+def classify_lease_mode(mac, data, subnet_leases):
+    '''Single source of truth for a lease's category (standard/compat/
+    playground) used for nft-set membership and reply topology. Deriving it the
+    same way everywhere keeps startup, SIGUSR1 reload, release, the DHCP reply
+    and diagnostics in agreement — a client cannot be filed into one set on add
+    and a different one on delete.
+
+    Compat is /30-block membership (subnet_leases) — authoritative and always
+    available. Otherwise the lease's stored 'mode' is used; it is written by
+    live allocation and preserved across restarts by load_leases. A lease with
+    no stored mode (only a static reservation before its first DHCP exchange)
+    defaults to STANDARD, the most-isolated / fail-closed category. It is NOT
+    guessed from the address: a playground block is chosen before leases load,
+    so an isolated client's address can fall inside it, and guessing would file
+    that client into the permissive playground set — an isolation downgrade.'''
+    if mac in subnet_leases:
+        return ClientClassifier.MODE_COMPAT
+    return data.get('mode') or ClientClassifier.MODE_STANDARD
+
 class RateLimiter:
     def __init__(self, rate=2.0, burst=5, max_clients=65536):
         self.rate = rate          # Tokens added per second
@@ -645,6 +664,13 @@ class LeaseManager:
                     self.leases[mac] = {
                         'ip': ip, 'expires': expires,
                         'masq': data.get('masq', False)}
+                    # Preserve the authoritative category across restarts.
+                    # Without this the reloaded lease is mode-less and would be
+                    # re-derived (defaulting to standard), so a playground or
+                    # compat client could be re-filed into the wrong nft set on
+                    # startup and needlessly reallocated on its first renewal.
+                    if 'mode' in data:
+                        self.leases[mac]['mode'] = data['mode']
                     if 'hostname' in data:
                         self.leases[mac]['hostname'] = data['hostname']
                     self.ip_to_mac[ip] = mac
@@ -732,12 +758,17 @@ class LeaseManager:
             except Exception as e:
                 logger.error(f'Hook callback failed: {e}')
 
+    def _effective_mode(self, mac, data):
+        '''Category for nft-set membership, resilient to leases (static or
+        disk-reloaded) that carry no 'mode' field. See classify_lease_mode.'''
+        return classify_lease_mode(mac, data, self.subnet_leases)
+
     def release(self, mac):
         with self.cv:
             if mac in self.leases:
                 data = self.leases[mac]
                 ip = data['ip']
-                mode = data.get('mode', ClientClassifier.MODE_STANDARD)
+                mode = self._effective_mode(mac, data)
                 is_masq = data.get('masq', False)
                 hostname = data.get('hostname', '')
 
@@ -925,7 +956,7 @@ class LeaseManager:
             # Renewal attempt
             if mac in self.leases:
                 lease = self.leases[mac]
-                old_mode = lease.get('mode', ClientClassifier.MODE_STANDARD)
+                old_mode = self._effective_mode(mac, lease)
                 was_masq = lease.get('masq', False)
 
                 if (old_mode != mode) or (was_masq != is_masq):
@@ -1168,7 +1199,11 @@ class LeaseManager:
             count = 0
             for mac, data in self.leases.items():
                 ip = data['ip']
-                mode = data.get('mode', ClientClassifier.MODE_STANDARD)
+                # Resolve the category from authoritative state, not the raw
+                # 'mode' field: static and disk-reloaded leases lack it, and
+                # defaulting them to standard used to file compat clients into
+                # the isolated set on every startup and reload.
+                mode = self._effective_mode(mac, data)
 
                 # Check if it is a compat/legacy lease
                 if mac in self.subnet_leases:
@@ -1931,10 +1966,15 @@ class UnnumberedDHCPServer:
             netmask_to_send = '255.255.255.255'
             with self.lease_mgr.lock:
                 lease = self.lease_mgr.leases.get(client_mac)
-                mode = lease.get('mode') \
-                    if lease else ClientClassifier.MODE_STANDARD
+                # Same shared classifier used by reapply/release/diagnostics, so
+                # a mode-less lease (static reservation, or a DHCPINFORM handled
+                # without going through allocation) still yields the right
+                # gateway and netmask instead of falling back to /32.
+                mode = classify_lease_mode(
+                    client_mac, lease or {}, self.lease_mgr.subnet_leases)
 
-                if mode == ClientClassifier.MODE_PLAYGROUND:
+                if mode == ClientClassifier.MODE_PLAYGROUND and \
+                   self.lease_mgr.playground_subnet:
                     router_ip = self.lease_mgr.playground_gateway
                     netmask_to_send = \
                         str(self.lease_mgr.playground_subnet.netmask)
@@ -2112,25 +2152,11 @@ class UnnumberedDHCPServer:
     # several things that may be managing this host's firewall.
 
     def _resolve_mode(self, mac, data, subnet_leases):
-        '''Resolve a lease's mode the way the daemon effectively does.
-        Compat-ness is subnet_leases membership; the 'mode' field is honoured
-        when present; and — because static/reloaded leases drop 'mode' —
-        playground-ness is recovered from playground-subnet membership so those
-        clients are not misreported as standard after a restart.'''
-        if mac in subnet_leases:
-            return ClientClassifier.MODE_COMPAT
-        mode = data.get('mode')
-        if mode:
-            return mode
-        ip = data.get('ip')
-        pg = self.lease_mgr.playground_subnet
-        if ip and pg:
-            try:
-                if ipaddress.IPv4Address(ip) in pg:
-                    return ClientClassifier.MODE_PLAYGROUND
-            except ValueError:
-                pass
-        return ClientClassifier.MODE_STANDARD
+        '''Diagnostics view of a lease's category. Uses the same shared
+        classifier as the daemon's own reapply/release paths, on a consistent
+        snapshot of subnet_leases, so what --verify expects matches what the
+        daemon actually applies.'''
+        return classify_lease_mode(mac, data, subnet_leases)
 
     def _compress_ranges(self, ip_objs_sorted):
         '''Collapse a sorted list of IPv4Address into compact range strings
