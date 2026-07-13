@@ -2132,6 +2132,25 @@ class UnnumberedDHCPServer:
                 pass
         return ClientClassifier.MODE_STANDARD
 
+    def _compress_ranges(self, ip_objs_sorted):
+        '''Collapse a sorted list of IPv4Address into compact range strings
+        ("a-b" for a run, "a" for a singleton). Keeps output bounded even on a
+        /16 pool, where listing every free address would be unusable.'''
+        ranges = []
+        start = prev = None
+        for ip in ip_objs_sorted:
+            if start is None:
+                start = prev = ip
+            elif int(ip) == int(prev) + 1:
+                prev = ip
+            else:
+                ranges.append(str(start) if start == prev
+                              else f'{start}-{prev}')
+                start = prev = ip
+        if start is not None:
+            ranges.append(str(start) if start == prev else f'{start}-{prev}')
+        return ranges
+
     def _count_free_slash30(self, free_ips):
         '''Number of aligned, fully-free /30 blocks (compat capacity). A
         fragmented pool can hold thousands of free IPs yet zero /30s.'''
@@ -2423,8 +2442,7 @@ class UnnumberedDHCPServer:
             subnet_leases = {m: dict(d) for m, d in lm.subnet_leases.items()}
             quarantine = dict(lm.quarantine)
             pool_total = len(lm.all_possible_ips)
-            free_sorted = sorted(lm.free_ips, key=ipaddress.IPv4Address) \
-                if 'pool' in sections else []
+            free_set = set(lm.free_ips) if 'pool' in sections else set()
         if 'leases' in sections:
             rows = []
             for m, d in sorted(leases.items()):
@@ -2455,9 +2473,13 @@ class UnnumberedDHCPServer:
                     'max': self.limiter.max_clients,
                     'saturated': bool(self.limiter._full_alerted)}
         if 'pool' in sections:
+            free_objs = sorted(ipaddress.IPv4Address(x) for x in free_set)
             out['sections']['pool'] = {
-                'total': pool_total, 'free_count': len(free_sorted),
-                'free_ips': [str(x) for x in free_sorted]}
+                'total': pool_total, 'free_count': len(free_objs),
+                'free_slash30_blocks': self._count_free_slash30(free_set),
+                # Ranges, not a full IP list: a /16 would otherwise dump 65k
+                # entries. Gaps in the ranges are the in-use/reserved IPs.
+                'free_ranges': self._compress_ranges(free_objs)}
         if 'config' in sections:
             out['sections']['config'] = self.diag_config(request)
         if 'firewall' in sections:
@@ -2999,9 +3021,11 @@ def render_dump(r, args):
               f"saturated={rl['saturated']}")
     if 'pool' in secs:
         p = secs['pool']
-        print(f"\nPOOL: {p['free_count']} free of {p['total']}")
-        preview = ', '.join(p['free_ips'][:64])
-        print(f"  {preview}{' …' if p['free_count'] > 64 else ''}")
+        print(f"\nPOOL: {p['free_count']} free of {p['total']} "
+              f"({p['free_slash30_blocks']} free /30 blocks). Free ranges "
+              f"(gaps are in use/reserved):")
+        for r in p['free_ranges']:
+            print(f"  {r}")
     if 'config' in secs:
         print()
         render_config(secs['config'], args)
