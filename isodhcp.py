@@ -18,7 +18,9 @@ from pyroute2.netlink.exceptions import NetlinkError
 
 INTERFACE = 'guest'
 LEASE_FILE = 'dhcp_leases_{INTERFACE}.json'
+SOCKET_FILE = 'isodhcp_{INTERFACE}.sock'
 LEASE_TIME = 3600
+VERSION = '1.0'
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -1178,6 +1180,174 @@ class LeaseManager:
                 count += 1
             return count
 
+def resolve_socket_path(iface, explicit=None, for_daemon=False):
+    '''Locate the diagnostics Unix socket for `iface`.
+
+    The daemon and the (same-binary) client must agree on a path without the
+    operator having to think about it. We probe a small ordered list of
+    well-known directories: systemd's $STATE_DIRECTORY (set for units with
+    StateDirectory=), the conventional /var/lib/isodhcp, and finally the cwd.
+    The daemon picks the first writable directory; the client picks the first
+    where the socket already exists (falling back to the daemon's choice for a
+    useful "not running" message). --socket overrides all of this.'''
+    if explicit:
+        return explicit
+    name = SOCKET_FILE.replace('{INTERFACE}', re.sub(r'[^a-zA-Z0-9]', '_', iface))
+    dirs = []
+    sd = os.environ.get('STATE_DIRECTORY')
+    if sd:
+        dirs.append(sd.split(':')[0])
+    dirs.append('/var/lib/isodhcp')
+    dirs.append(os.getcwd())
+    seen = set()
+    cands = []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            cands.append(os.path.join(d, name))
+    if for_daemon:
+        for c in cands:
+            parent = os.path.dirname(c)
+            if os.path.isdir(parent) and os.access(parent, os.W_OK):
+                return c
+    else:
+        for c in cands:
+            if os.path.exists(c):
+                return c
+    return cands[0]
+
+class DiagnosticsServer:
+    '''Read-only introspection endpoint served over a Unix domain socket.
+
+    isodhcp ships as a single binary that runs as a capability-holding systemd
+    service. Rather than make operators reproduce those privileges (or read
+    kernel/nftables state that could race the daemon), the running daemon
+    answers status/config/dump/show/verify queries here, and the same binary
+    invoked in client mode just formats the reply. The socket is 0600 and, via
+    SO_PEERCRED, only serves the daemon's own uid or root. Every handler is
+    wrapped so a diagnostics fault can never take down DHCP service.'''
+
+    def __init__(self, server, socket_path):
+        self.server = server
+        self.socket_path = socket_path
+        self.running = True
+        self._sock = None
+        self.allowed_uids = {os.getuid(), 0}
+
+    def _peer_allowed(self, conn):
+        try:
+            raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                  struct.calcsize('3i'))
+            _pid, uid, _gid = struct.unpack('3i', raw)
+            return uid in self.allowed_uids
+        except Exception:
+            return False
+
+    def handle_client(self, conn):
+        try:
+            conn.settimeout(5.0)
+            data = b''
+            while b'\n' not in data and len(data) < 65536:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            if not data:
+                return
+            if not self._peer_allowed(conn):
+                self._send(conn, {'status': 'error',
+                                  'message': 'permission denied: run the '
+                                  'client as the isodhcp service user or root'})
+                return
+            try:
+                request = json.loads(data.decode('utf-8'))
+            except Exception:
+                self._send(conn, {'status': 'error',
+                                  'message': 'malformed request'})
+                return
+            cmd = request.get('cmd')
+            handlers = {
+                'status': self.server.diag_status,
+                'config': self.server.diag_config,
+                'dump': self.server.diag_dump,
+                'show': self.server.diag_show,
+                'verify': self.server.diag_verify,
+            }
+            handler = handlers.get(cmd)
+            if not handler:
+                self._send(conn, {'status': 'error',
+                                  'message': f'unknown command: {cmd}'})
+                return
+            try:
+                resp = handler(request)
+            except Exception as e:
+                logger.error(f'Diagnostics handler "{cmd}" failed: {e}')
+                resp = {'status': 'error', 'message': f'internal error: {e}'}
+            self._send(conn, resp)
+        except Exception as e:
+            logger.debug(f'Diagnostics client error: {e}')
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _send(self, conn, obj):
+        try:
+            conn.sendall((json.dumps(obj) + '\n').encode('utf-8'))
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            if os.path.exists(self.socket_path):
+                os.remove(self.socket_path)
+        except OSError as e:
+            logger.error(f'Diagnostics: cannot clear stale socket '
+                         f'{self.socket_path}: {e} (introspection disabled)')
+            return
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.bind(self.socket_path)
+            s.listen(4)
+            os.chmod(self.socket_path, 0o600)
+        except Exception as e:
+            logger.error(f'Diagnostics: failed to bind {self.socket_path}: '
+                         f'{e} (introspection disabled)')
+            return
+        self._sock = s
+        logger.info(f'🔌 Diagnostics socket ready: {self.socket_path}')
+        while self.running:
+            try:
+                conn, _ = s.accept()
+            except OSError:
+                break
+            t = threading.Thread(target=self.handle_client, args=(conn,),
+                                 daemon=True)
+            t.start()
+        try:
+            s.close()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.running = False
+        try:
+            # Unblock accept() with a throwaway self-connection.
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                c.connect(self.socket_path)
+            except Exception:
+                pass
+            c.close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(self.socket_path):
+                os.remove(self.socket_path)
+        except Exception:
+            pass
+
 class UnnumberedDHCPServer:
     def __init__(self, interface, server_ip=None, pool_cidr=None,
                  dns_server=None, lease_time=LEASE_TIME,
@@ -1188,10 +1358,12 @@ class UnnumberedDHCPServer:
                  nft_iso=None, nft_compat=None, nft_set_playground=None,
                  nft_set_playground_subnet=None, nft_gw=None, nft_net=None,
                  nft_bcast=None, nft_subnet=None, hook_file=None,
-                 isolation_mode='system', custom_options=None):
+                 isolation_mode='system', custom_options=None,
+                 socket_path=None):
         self.iface = interface
         self.lease_time = lease_time
         self.lease_file = lease_file
+        self.start_time = time.time()
         self.limiter = RateLimiter(rate=2.0, burst=5)
 
         self.pg_macs = pg_macs or set()
@@ -1301,6 +1473,12 @@ class UnnumberedDHCPServer:
             'ISODHCP_INTERFACE': self.iface,
             'ISODHCP_DNS': self.dns_server
         })
+
+        # Read-only diagnostics endpoint (single-binary client mode talks here).
+        self.socket_path = resolve_socket_path(
+            self.iface, explicit=socket_path, for_daemon=True)
+        self.diag = DiagnosticsServer(self, self.socket_path)
+        self.diag_thread = threading.Thread(target=self.diag.run, daemon=True)
 
     def sync_kernel_routes(self):
         '''
@@ -1911,9 +2089,691 @@ class UnnumberedDHCPServer:
         finally:
             ipr.close()
 
+    # ----- Diagnostics (answered on the Unix socket for client mode) -----
+    #
+    # These run on the diagnostics thread. They read live in-memory state under
+    # lease_mgr.lock but NEVER hold that lock across a kernel/nft read (which
+    # can be slow and would stall the DHCP path). Everything is scoped to
+    # isodhcp's OWN footprint: its private table, the sets it was configured to
+    # populate, in-pool interface aliases, and in-pool /32 routes. It never
+    # inspects or flags foreign tables/rules/addresses — isodhcp is only one of
+    # several things that may be managing this host's firewall.
+
+    def _resolve_mode(self, mac, data, subnet_leases):
+        '''Resolve a lease's mode the way the daemon effectively does.
+        Compat-ness is subnet_leases membership; the 'mode' field is honoured
+        when present; and — because static/reloaded leases drop 'mode' —
+        playground-ness is recovered from playground-subnet membership so those
+        clients are not misreported as standard after a restart.'''
+        if mac in subnet_leases:
+            return ClientClassifier.MODE_COMPAT
+        mode = data.get('mode')
+        if mode:
+            return mode
+        ip = data.get('ip')
+        pg = self.lease_mgr.playground_subnet
+        if ip and pg:
+            try:
+                if ipaddress.IPv4Address(ip) in pg:
+                    return ClientClassifier.MODE_PLAYGROUND
+            except ValueError:
+                pass
+        return ClientClassifier.MODE_STANDARD
+
+    def _count_free_slash30(self, free_ips):
+        '''Number of aligned, fully-free /30 blocks (compat capacity). A
+        fragmented pool can hold thousands of free IPs yet zero /30s.'''
+        n = 0
+        for ip in free_ips:
+            if int(ipaddress.IPv4Address(ip)) % 4:
+                continue
+            net = ipaddress.IPv4Network(f'{ip}/30')
+            if all(str(x) in free_ips for x in net):
+                n += 1
+        return n
+
+    def _connected_nets(self, aliases):
+        '''Networks the interface is directly connected to, derived from its
+        addresses. A client covered by one is reachable without a /32 host
+        route (numbered deployment), so its missing /32 is not a fault.'''
+        nets = []
+        for aip, apfx in aliases.items():
+            try:
+                nets.append(ipaddress.IPv4Interface(f'{aip}/{apfx}').network)
+            except ValueError:
+                pass
+        return nets
+
+    def _nft_json(self, argv):
+        '''Run an `nft -j` read command. Returns (parsed, error_or_None).
+        Forces the C locale and explicit UTF-8 decoding so neither the JSON nor
+        any error text depends on the caller's locale.'''
+        try:
+            r = subprocess.run(
+                ['nft', '-j'] + argv, capture_output=True, encoding='utf-8',
+                env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
+        except FileNotFoundError:
+            return None, 'nft not installed'
+        except Exception as e:
+            return None, str(e)
+        if r.returncode != 0:
+            return None, (r.stderr.strip().splitlines()[0]
+                          if r.stderr.strip() else 'nft returned non-zero')
+        try:
+            return json.loads(r.stdout), None
+        except Exception as e:
+            return None, f'unparseable nft output: {e}'
+
+    def _nft_elem_to_str(self, e):
+        '''Normalise one nft -j set element to a string. Handles every form:
+        a bare "1.2.3.4"; an interval {"prefix":{"addr","len"}}; and the
+        {"elem":{"val": ...}} wrapper nft emits for sets with flags
+        timeout/dynamic or per-element counters (whose val may itself be a
+        prefix). Returns None for anything unrecognised.'''
+        if isinstance(e, str):
+            return e
+        if isinstance(e, dict):
+            if 'elem' in e and isinstance(e['elem'], dict):
+                return self._nft_elem_to_str(e['elem'].get('val'))
+            if 'prefix' in e:
+                p = e['prefix']
+                return f"{p['addr']}/{p['len']}"
+        return None
+
+    def _read_set_elements(self, setspec):
+        '''Elements of a configured named set. Returns (set_of_strings,
+        error_or_None). A malformed element is skipped, not fatal.'''
+        data, err = self._nft_json(['list', 'set'] + setspec.split())
+        if err:
+            return None, err
+        elems = set()
+        for o in data.get('nftables', []):
+            s = o.get('set')
+            if not s:
+                continue
+            for e in s.get('elem', []):
+                try:
+                    v = self._nft_elem_to_str(e)
+                except Exception:
+                    v = None
+                if v is not None:
+                    elems.add(v)
+        return elems, None
+
+    def _read_snat_rules(self):
+        '''Map daddr -> [snat targets] from OUR private postrouting chain.'''
+        data, err = self._nft_json(
+            ['list', 'chain', 'ip', self.sys.table_name, 'postrouting'])
+        if err:
+            return None, err
+        rules = {}
+        for o in data.get('nftables', []):
+            rule = o.get('rule')
+            if not rule:
+                continue
+            try:
+                daddr = snat = None
+                for e in rule.get('expr', []):
+                    if 'match' in e:
+                        left = e['match'].get('left')
+                        if isinstance(left, dict) and \
+                           left.get('payload', {}).get('field') == 'daddr' and \
+                           e['match'].get('op') == '==':
+                            daddr = e['match'].get('right')
+                    if 'snat' in e and isinstance(e['snat'], dict):
+                        snat = e['snat'].get('addr')
+                if daddr and snat:
+                    rules.setdefault(daddr, []).append(snat)
+            except Exception:
+                continue
+        return rules, None
+
+    def _read_kernel_l3(self):
+        '''Live /32 routes and interface addresses on our interface. Uses a
+        fresh IPRoute() — self.ipr belongs to the sniff/GC threads.'''
+        routes32, aliases = set(), {}
+        try:
+            with IPRoute() as ipr:
+                for r in ipr.get_routes(oif=self.if_index, family=2):
+                    a = dict(r['attrs'])
+                    # Only OUR host routes: /32, main table (254), unicast (1).
+                    # get_routes(oif=...) also returns the kernel's automatic
+                    # local/broadcast /32s from the local table (255) — those
+                    # are not isodhcp routes and must not be mistaken for drift.
+                    # On policy-routing boxes the table id can arrive via
+                    # RTA_TABLE rather than the compat 'table' field, so prefer
+                    # the attribute. isodhcp only ever writes the main table.
+                    tbl = a.get('RTA_TABLE', r.get('table'))
+                    if r.get('dst_len') == 32 and tbl == 254 and \
+                       r.get('type') == 1:
+                        dst = a.get('RTA_DST')
+                        if dst:
+                            routes32.add(dst)
+                for a in ipr.get_addr(index=self.if_index, family=2):
+                    local = dict(a['attrs']).get('IFA_LOCAL')
+                    if local:
+                        aliases[local] = a['prefixlen']
+        except Exception as e:
+            logger.error(f'Diagnostics: kernel L3 read failed: {e}')
+        return routes32, aliases
+
+    def _read_routes_raw(self):
+        '''Every route on our interface with its table/type/proto exposed, so
+        an operator can extract unfiltered ground truth (no interpretation).'''
+        rows = []
+        try:
+            with IPRoute() as ipr:
+                for r in ipr.get_routes(oif=self.if_index, family=2):
+                    a = dict(r['attrs'])
+                    rows.append({
+                        'dst': a.get('RTA_DST') or 'default',
+                        'dst_len': r.get('dst_len'),
+                        'table': a.get('RTA_TABLE', r.get('table')),
+                        'type': r.get('type'),
+                        'proto': r.get('proto'),
+                        'scope': r.get('scope'),
+                    })
+        except Exception as e:
+            logger.error(f'Diagnostics: raw route read failed: {e}')
+        return rows
+
+    def diag_firewall(self, request):
+        '''Raw ACTUAL kernel/nftables state as the daemon sees it — the
+        ground truth to compare against --dump leases and --verify. Reads live
+        state; holds no lock.'''
+        routes32, aliases = self._read_kernel_l3()
+        snat, snat_err = self._read_snat_rules()
+        sets_out = {}
+        managed = [
+            ('isolated', self.sys.nft_iso), ('compat', self.sys.nft_compat),
+            ('playground', self.sys.nft_playground),
+            ('playground_subnet', self.sys.nft_playground_subnet),
+            ('gateway', self.sys.nft_gw), ('network', self.sys.nft_net),
+            ('broadcast', self.sys.nft_bcast), ('subnet', self.sys.nft_subnet),
+        ]
+        for label, spec in managed:
+            if not spec:
+                continue
+            elems, err = self._read_set_elements(spec)
+            sets_out[label] = {'spec': spec, 'error': err,
+                               'elements': (sorted(elems) if elems else [])}
+        return {
+            'status': 'ok', 'version': VERSION,
+            'iface': self.iface, 'private_table': self.sys.table_name,
+            'host_routes_32': sorted(routes32, key=ipaddress.IPv4Address),
+            'routes_raw': self._read_routes_raw(),
+            'interface_aliases': dict(sorted(
+                aliases.items(), key=lambda kv: ipaddress.IPv4Address(kv[0]))),
+            'snat_rules': ('UNREADABLE: ' + snat_err) if snat_err else snat,
+            'nft_sets': sets_out,
+        }
+
+    def diag_status(self, request):
+        lm = self.lease_mgr
+        now = time.time()
+        with lm.lock:
+            leases = {m: dict(d) for m, d in lm.leases.items()}
+            subnet_leases = {m: dict(d) for m, d in lm.subnet_leases.items()}
+            free_ips = set(lm.free_ips)
+            pool_total = len(lm.all_possible_ips)
+            quarantine = dict(lm.quarantine)
+            q_cap = lm.quarantine_cap
+            pg_subnet = str(lm.playground_subnet) if lm.playground_subnet \
+                else None
+            pg_gw = lm.playground_gateway
+            pg_free = len(lm.playground_free_ips)
+            next_exp = lm.get_next_expiration()
+        with self.limiter.lock:
+            rl_tracked = len(self.limiter.clients)
+            rl_max = self.limiter.max_clients
+            rl_sat = self.limiter._full_alerted
+        standard = compat = playground = 0
+        for m, d in leases.items():
+            mode = self._resolve_mode(m, d, subnet_leases)
+            if mode == ClientClassifier.MODE_COMPAT:
+                compat += 1
+            elif mode == ClientClassifier.MODE_PLAYGROUND:
+                playground += 1
+            else:
+                standard += 1
+        free = len(free_ips)
+        util = round(100.0 * (pool_total - free) / pool_total, 1) \
+            if pool_total else 0.0
+        return {
+            'status': 'ok', 'version': VERSION, 'pid': os.getpid(),
+            'iface': self.iface, 'server_ip': str(self.server_ip),
+            'pool_cidr': str(self.pool_cidr),
+            'isolation_mode': self.sys.isolation_mode if self.sys else 'unknown',
+            'uptime_seconds': round(now - self.start_time, 1),
+            'pool': {
+                'total': pool_total, 'leased': len(leases), 'free': free,
+                'quarantined': len(quarantine), 'utilization_pct': util,
+                'free_slash30_blocks': self._count_free_slash30(free_ips),
+            },
+            'clients': {'standard': standard, 'compat': compat,
+                        'playground': playground},
+            'quarantine': {'count': len(quarantine), 'cap': q_cap,
+                           'at_cap': len(quarantine) >= q_cap},
+            'ratelimit': {'tracked': rl_tracked, 'max': rl_max,
+                          'saturated': bool(rl_sat)},
+            'playground': ({'subnet': pg_subnet, 'gateway': pg_gw,
+                            'free': pg_free, 'used': playground}
+                           if pg_subnet else None),
+            'next_expiry_epoch': (None if next_exp in (None, float('inf'))
+                                  else round(next_exp, 1)),
+            'lease_file': os.path.abspath(self.lease_file),
+            'socket': self.socket_path,
+        }
+
+    def diag_config(self, request):
+        lm = self.lease_mgr
+        srt = lambda s: sorted(s) if s else []
+        return {
+            'status': 'ok', 'version': VERSION, 'iface': self.iface,
+            'server_ip': str(self.server_ip), 'pool_cidr': str(self.pool_cidr),
+            'dns_server': self.dns_server, 'lease_time': self.lease_time,
+            'lease_file': os.path.abspath(self.lease_file),
+            'socket': self.socket_path,
+            'isolation_mode': self.sys.isolation_mode if self.sys else 'unknown',
+            'private_table': self.sys.table_name,
+            'playground': ({'subnet': str(lm.playground_subnet),
+                            'gateway': lm.playground_gateway}
+                           if lm.playground_subnet else None),
+            'classifier': {
+                'compat_macs': srt(self.compat_macs),
+                'compat_ouis': srt(self.compat_ouis),
+                'compat_vendors': srt(self.compat_vendors),
+                'playground_macs': srt(self.pg_macs),
+                'playground_ouis': srt(self.pg_ouis),
+                'playground_vendors': srt(self.pg_vendors),
+                'masquerade_macs': srt(self.masq_macs),
+                'masquerade_ouis': srt(self.masq_ouis),
+                'masquerade_vendors': srt(self.masq_vendors),
+            },
+            'nft_sets': {
+                'isolated': self.sys.nft_iso, 'compat': self.sys.nft_compat,
+                'playground': self.sys.nft_playground,
+                'playground_subnet': self.sys.nft_playground_subnet,
+                'gateway': self.sys.nft_gw, 'network': self.sys.nft_net,
+                'broadcast': self.sys.nft_bcast, 'subnet': self.sys.nft_subnet,
+            },
+            'static_count': len(lm.static_map),
+            'custom_option_codes': [c for c, _ in self.custom_options],
+        }
+
+    def diag_dump(self, request):
+        sections = request.get('sections') or ['leases', 'subnets']
+        lm = self.lease_mgr
+        now = time.time()
+        out = {'status': 'ok', 'version': VERSION, 'sections': {}}
+        with lm.lock:
+            leases = {m: dict(d) for m, d in lm.leases.items()}
+            subnet_leases = {m: dict(d) for m, d in lm.subnet_leases.items()}
+            quarantine = dict(lm.quarantine)
+            pool_total = len(lm.all_possible_ips)
+            free_sorted = sorted(lm.free_ips, key=ipaddress.IPv4Address) \
+                if 'pool' in sections else []
+        if 'leases' in sections:
+            rows = []
+            for m, d in sorted(leases.items()):
+                exp = d.get('expires')
+                rows.append({
+                    'mac': m, 'ip': d.get('ip'), 'hostname': d.get('hostname'),
+                    'mode': self._resolve_mode(m, d, subnet_leases),
+                    'masq': bool(d.get('masq')),
+                    'static': exp == float('inf'),
+                    'expires_epoch': None if exp == float('inf') else exp,
+                })
+            out['sections']['leases'] = rows
+        if 'subnets' in sections:
+            out['sections']['subnets'] = [
+                {'mac': m, 'gateway': d['gateway'], 'subnet': d['subnet']}
+                for m, d in sorted(subnet_leases.items())]
+        if 'quarantine' in sections:
+            out['sections']['quarantine'] = [
+                {'ip': ip, 'release_epoch': round(exp, 1),
+                 'release_in': round(exp - now, 1)}
+                for ip, exp in sorted(
+                    quarantine.items(),
+                    key=lambda kv: ipaddress.IPv4Address(kv[0]))]
+        if 'ratelimit' in sections:
+            with self.limiter.lock:
+                out['sections']['ratelimit'] = {
+                    'tracked': len(self.limiter.clients),
+                    'max': self.limiter.max_clients,
+                    'saturated': bool(self.limiter._full_alerted)}
+        if 'pool' in sections:
+            out['sections']['pool'] = {
+                'total': pool_total, 'free_count': len(free_sorted),
+                'free_ips': [str(x) for x in free_sorted]}
+        if 'config' in sections:
+            out['sections']['config'] = self.diag_config(request)
+        if 'firewall' in sections:
+            out['sections']['firewall'] = self.diag_firewall(request)
+        return out
+
+    def diag_show(self, request):
+        key = (request.get('key') or '').strip().lower()
+        lm = self.lease_mgr
+        with lm.lock:
+            leases = {m: dict(d) for m, d in lm.leases.items()}
+            subnet_leases = {m: dict(d) for m, d in lm.subnet_leases.items()}
+        found = None
+        if key in leases:
+            found = key
+        else:
+            for m, d in leases.items():
+                if d.get('ip') == key or \
+                   (d.get('hostname') or '').lower() == key:
+                    found = m
+                    break
+        if not found:
+            return {'status': 'error', 'message': f'no lease matching "{key}"'}
+        d = leases[found]
+        ip = d.get('ip')
+        is_compat = found in subnet_leases
+        mode = self._resolve_mode(found, d, subnet_leases)
+        exp = d.get('expires')
+        info = {
+            'status': 'ok', 'mac': found, 'ip': ip,
+            'hostname': d.get('hostname'), 'mode': mode,
+            'masq': bool(d.get('masq')), 'static': exp == float('inf'),
+            'expires_epoch': None if exp == float('inf') else exp,
+        }
+        if is_compat:
+            info['gateway'] = subnet_leases[found]['gateway']
+            info['subnet'] = subnet_leases[found]['subnet']
+        # Scoped resource checklist (live reads).
+        routes32, aliases = self._read_kernel_l3()
+        checks = []
+        if is_compat:
+            gw = subnet_leases[found]['gateway']
+            checks.append({'resource': 'gateway_alias',
+                           'detail': f'{gw}/30 on {self.iface}',
+                           'present': gw in aliases})
+        else:
+            # Present if a /32 host route exists OR a connected route on the
+            # interface already reaches it (numbered deployment).
+            has32 = ip in routes32
+            try:
+                obj = ipaddress.IPv4Address(ip)
+                covered = any(obj in n
+                              for n in self._connected_nets(aliases))
+            except ValueError:
+                covered = False
+            if has32:
+                detail = f'{ip}/32 host route'
+            elif covered:
+                detail = f'{ip} (reachable via connected route)'
+            else:
+                detail = f'{ip}/32 host route'
+            checks.append({'resource': 'route', 'detail': detail,
+                           'present': has32 or covered})
+        if is_compat:
+            setspec = self.sys.nft_compat
+        elif mode == ClientClassifier.MODE_PLAYGROUND:
+            setspec = self.sys.nft_playground
+        else:
+            setspec = self.sys.nft_iso
+        if setspec:
+            elems, err = self._read_set_elements(setspec)
+            checks.append({'resource': 'nft_set', 'detail': setspec,
+                           'present': None if err else (ip in elems),
+                           'error': err})
+        if d.get('masq'):
+            rules, err = self._read_snat_rules()
+            checks.append({'resource': 'snat', 'detail': f'daddr {ip}',
+                           'present': None if err else (ip in rules),
+                           'error': err})
+        info['checks'] = checks
+        return info
+
+    def diag_verify(self, request):
+        lm = self.lease_mgr
+        pool = ipaddress.IPv4Network(self.pool_cidr)
+        server_ip = str(self.server_ip)
+        # 1. Cheap snapshot under the lock; release before any kernel read.
+        with lm.lock:
+            leases = {m: dict(d) for m, d in lm.leases.items()}
+            subnet_leases = {m: dict(d) for m, d in lm.subnet_leases.items()}
+            ip_to_mac = dict(lm.ip_to_mac)
+            free_ips = set(lm.free_ips)
+            quarantine = set(lm.quarantine.keys())
+            pg_subnet = str(lm.playground_subnet) if lm.playground_subnet \
+                else None
+            pg_gw = lm.playground_gateway
+        snap1 = {m: (d.get('ip'), d.get('expires')) for m, d in leases.items()}
+
+        disc = []
+
+        def add(sev, resource, kind, detail, mac=None, ip=None):
+            disc.append({'severity': sev, 'resource': resource, 'kind': kind,
+                         'detail': detail, 'mac': mac, 'ip': ip,
+                         'transient': False})
+
+        # 2. Derive INTENDED state from the snapshot (isodhcp's footprint only).
+        intended_routes = {ip for ip, m in ip_to_mac.items()
+                           if m not in subnet_leases}
+        iso_ips, compat_ips, pg_ips = set(), set(), set()
+        gw_ips, net_ips, bcast_ips, subnet_cidrs = set(), set(), set(), set()
+        intended_masq = {}
+        intended_aliases = {server_ip}
+        if pg_gw:
+            intended_aliases.add(pg_gw)
+        for m, d in leases.items():
+            ip = d.get('ip')
+            if not ip:
+                continue
+            mode = self._resolve_mode(m, d, subnet_leases)
+            if mode == ClientClassifier.MODE_COMPAT:
+                compat_ips.add(ip)
+            elif mode == ClientClassifier.MODE_PLAYGROUND:
+                pg_ips.add(ip)
+            else:
+                iso_ips.add(ip)
+            if d.get('masq'):
+                if mode == ClientClassifier.MODE_COMPAT and m in subnet_leases:
+                    acceptable = {subnet_leases[m]['gateway']}
+                elif mode == ClientClassifier.MODE_PLAYGROUND:
+                    # A fresh allocation SNATs a playground client to the
+                    # playground gateway; a SIGUSR1 reapply SNATs it to the
+                    # server IP. Both states occur on a running daemon, so
+                    # accept either rather than emit a false wrong-target.
+                    acceptable = {server_ip}
+                    if pg_gw:
+                        acceptable.add(pg_gw)
+                else:
+                    acceptable = {server_ip}
+                intended_masq[ip] = acceptable
+        for m, sub in subnet_leases.items():
+            try:
+                net = ipaddress.IPv4Network(sub['subnet'])
+                blk = [str(x) for x in net]
+                net_ips.add(blk[0])
+                gw_ips.add(blk[1])
+                bcast_ips.add(blk[3])
+                subnet_cidrs.add(str(net))
+                intended_aliases.add(sub['gateway'])
+            except Exception:
+                pass
+
+        # 3. Read ACTUAL kernel/nft state (lock released).
+        routes32, aliases = self._read_kernel_l3()
+        snat_actual, snat_err = self._read_snat_rules()
+
+        # A. /32 host routes.
+        # A per-client /32 is only REQUIRED when the interface is unnumbered
+        # (no connected route covers the client). On a numbered deployment the
+        # server holds e.g. 10.0.0.1/24 on the interface, so the connected route
+        # already reaches every client and the /32 is redundant — the daemon
+        # deliberately skips it there. So only alarm when a client is reachable
+        # by NEITHER a /32 NOR a connected route on this interface. Isolation
+        # itself is enforced by the /32 netmask handed to the client, not by
+        # these router-side routes.
+        connected_nets = self._connected_nets(aliases)
+
+        def _covered(ip):
+            try:
+                obj = ipaddress.IPv4Address(ip)
+            except ValueError:
+                return False
+            return any(obj in n for n in connected_nets)
+
+        for ip in intended_routes:
+            if ip not in routes32 and not _covered(ip):
+                add('alarming', 'route', 'missing',
+                    f'{ip} has no /32 host route and is not covered by a '
+                    f'connected route on {self.iface}',
+                    mac=ip_to_mac.get(ip), ip=ip)
+        for ip in routes32:
+            try:
+                obj = ipaddress.IPv4Address(ip)
+            except ValueError:
+                continue
+            if obj not in pool or ip == server_ip or \
+               obj == pool.network_address or obj == pool.broadcast_address:
+                continue
+            if ip in intended_routes:
+                continue
+            if ip in compat_ips:
+                add('low', 'route', 'compat_redundant_32',
+                    f'redundant /32 route for compat client {ip}', ip=ip)
+            else:
+                add('moderate', 'route', 'orphan',
+                    f'/32 route {ip} on {self.iface} with no matching lease '
+                    f'(stale, or added by other software)', ip=ip)
+
+        # B. Interface aliases (in-pool only; foreign addresses are ignored)
+        if server_ip not in aliases:
+            add('alarming', 'alias', 'missing',
+                f'server IP {server_ip} not present on {self.iface}',
+                ip=server_ip)
+        for ip in intended_aliases:
+            if ip != server_ip and ip not in aliases:
+                add('alarming', 'alias', 'missing',
+                    f'gateway alias {ip} missing from {self.iface}', ip=ip)
+        for ip, pfx in aliases.items():
+            try:
+                if ipaddress.IPv4Address(ip) not in pool:
+                    continue
+            except ValueError:
+                continue
+            if ip not in intended_aliases:
+                add('moderate', 'alias', 'orphan',
+                    f'stale in-pool alias {ip}/{pfx} on {self.iface}', ip=ip)
+            elif ip in gw_ips and pfx != 30:
+                add('moderate', 'alias', 'wrong_prefix',
+                    f'gateway {ip} has /{pfx}, expected /30', ip=ip)
+
+        # C. SNAT rules in our private table
+        if snat_err:
+            add('unknown', 'snat', 'unreadable',
+                f'cannot read SNAT chain: {snat_err}')
+        else:
+            for ip, acceptable in intended_masq.items():
+                targets = snat_actual.get(ip)
+                if not targets:
+                    add('alarming', 'snat', 'missing',
+                        f'SNAT rule for {ip} missing', ip=ip)
+                elif not (set(targets) & acceptable):
+                    add('alarming', 'snat', 'wrong_target',
+                        f'SNAT for {ip} targets {targets}, expected one of '
+                        f'{sorted(acceptable)}', ip=ip)
+                elif len(targets) > 1:
+                    add('low', 'snat', 'duplicate',
+                        f'{len(targets)} SNAT rules for {ip}', ip=ip)
+            for ip in snat_actual:
+                if ip not in intended_masq:
+                    add('moderate', 'snat', 'orphan',
+                        f'stale SNAT rule for {ip} (no masquerade lease)', ip=ip)
+
+        # D. Configured named sets (element-level; only sets we manage)
+        managed_sets = [
+            (self.sys.nft_iso, iso_ips, 'nft_isolated'),
+            (self.sys.nft_compat, compat_ips, 'nft_compat'),
+            (self.sys.nft_playground, pg_ips, 'nft_playground'),
+            (self.sys.nft_gw, gw_ips, 'nft_gateway'),
+            (self.sys.nft_net, net_ips, 'nft_network'),
+            (self.sys.nft_bcast, bcast_ips, 'nft_broadcast'),
+            (self.sys.nft_subnet, subnet_cidrs, 'nft_subnet'),
+            (self.sys.nft_playground_subnet,
+             ({pg_subnet} if pg_subnet else set()), 'nft_playground_subnet'),
+        ]
+        for setspec, intended_elems, label in managed_sets:
+            if not setspec:
+                continue
+            actual, err = self._read_set_elements(setspec)
+            if err:
+                add('unknown', label, 'unreadable',
+                    f'set "{setspec}" unreadable: {err}')
+                continue
+            for el in intended_elems:
+                if el not in actual:
+                    add('alarming', label, 'missing_element',
+                        f'{el} missing from set "{setspec}"', ip=el)
+            for el in actual:
+                if el not in intended_elems:
+                    # Low, not moderate: these named sets can legitimately be
+                    # co-managed by other firewall software on this host, so an
+                    # element we don't recognise is not necessarily our stale
+                    # entry and must not chronically fail a monitoring check.
+                    add('low', label, 'extra_element',
+                        f'{el} in set "{setspec}" without a lease '
+                        f'(stale, or managed by other software)', ip=el)
+
+        # E. In-memory invariants (no kernel reads; always run)
+        for ip in (free_ips & set(ip_to_mac.keys())):
+            add('alarming', 'internal', 'double_alloc',
+                f'{ip} is simultaneously free and leased', ip=ip)
+        for ip, m in ip_to_mac.items():
+            if m not in leases:
+                add('alarming', 'internal', 'index_desync',
+                    f'{ip} indexed to {m} but {m} has no lease', mac=m, ip=ip)
+        for m in subnet_leases:
+            if m not in leases:
+                add('alarming', 'internal', 'subnet_orphan',
+                    f'subnet lease for {m} with no base lease', mac=m)
+        for ip in (quarantine & free_ips):
+            add('low', 'internal', 'quarantine_overlap',
+                f'{ip} is both quarantined and free', ip=ip)
+
+        # 4. Tag discrepancies for leases that changed during the read as
+        # transient (racy snapshot, not real drift).
+        with lm.lock:
+            snap2 = {m: (d.get('ip'), d.get('expires'))
+                     for m, d in lm.leases.items()}
+        for x in disc:
+            m = x.get('mac')
+            if not m and x.get('ip'):
+                m = ip_to_mac.get(x['ip'])
+            if m and snap1.get(m) != snap2.get(m):
+                x['transient'] = True
+
+        alarming = sum(1 for x in disc
+                       if x['severity'] == 'alarming' and not x['transient'])
+        moderate = sum(1 for x in disc
+                       if x['severity'] == 'moderate' and not x['transient'])
+        low = sum(1 for x in disc
+                  if x['severity'] == 'low' and not x['transient'])
+        unknown = sum(1 for x in disc if x['severity'] == 'unknown')
+        transient = sum(1 for x in disc if x['transient'])
+        return {
+            'status': 'ok',
+            'ok': (alarming == 0 and moderate == 0 and unknown == 0),
+            'summary': {'alarming': alarming, 'moderate': moderate, 'low': low,
+                        'unknown': unknown, 'transient': transient,
+                        'total': len(disc)},
+            'discrepancies': disc,
+        }
+
     def shutdown(self):
         '''Cleanup tasks to run when the server stops.'''
         logger.info('🛑 Server shutting down...')
+
+        try:
+            self.diag.stop()
+        except Exception:
+            pass
 
         # Force save leases to disk (save_leases writes unconditionally
         # when called directly)
@@ -1924,6 +2784,9 @@ class UnnumberedDHCPServer:
         logger.info(f'🚀 DHCP Server active on "{self.iface}"')
         logger.info(f'   IP: {self.server_ip} | Pool: {self.pool_cidr}')
         logger.info(f'   DNS: {self.dns_server} | Lease: {self.lease_time}s')
+
+        # Bring up the diagnostics socket before we block in sniff().
+        self.diag_thread.start()
 
         # Ensure clean state on startup too!
         self.sync_interface_addresses()
@@ -1975,6 +2838,273 @@ def parse_custom_options(raw_options):
             logger.critical(f'⛔ Invalid custom option "{opt}": {e}')
             sys.exit(1)
     return parsed
+
+# ----- Client mode (same binary, --status/--verify/--dump/--show/--config) ---
+
+def diag_query(payload, socket_path):
+    '''Send one request to the daemon's socket; return (response, error).'''
+    if not os.path.exists(socket_path):
+        return None, f'daemon not running (no socket at {socket_path})'
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(15.0)
+        c.connect(socket_path)
+    except (ConnectionRefusedError, FileNotFoundError):
+        return None, (f'daemon not running (stale socket at {socket_path})')
+    except Exception as e:
+        return None, str(e)
+    try:
+        c.sendall((json.dumps(payload) + '\n').encode('utf-8'))
+        buf = b''
+        while b'\n' not in buf:
+            chunk = c.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        if not buf:
+            return None, 'empty response from daemon'
+        return json.loads(buf.decode('utf-8')), None
+    except Exception as e:
+        return None, str(e)
+    finally:
+        c.close()
+
+def _fmt_epoch(e):
+    if e is None:
+        return '-'
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e))
+
+_MAC_RE = re.compile(r'\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b')
+
+def _redact_mac(mac):
+    parts = mac.split(':')
+    return ':'.join(parts[:3] + ['xx', 'xx', 'xx']) if len(parts) == 6 else mac
+
+def _redact_obj(o):
+    if isinstance(o, dict):
+        r = {}
+        for k, v in o.items():
+            if k == 'hostname':
+                r[k] = None
+            elif k == 'mac' and isinstance(v, str):
+                r[k] = _redact_mac(v)
+            elif k in ('compat_macs', 'playground_macs',
+                       'masquerade_macs') and isinstance(v, list):
+                r[k] = [_redact_mac(x) for x in v]
+            elif isinstance(v, str):
+                # Scrub any MAC embedded in free-text (e.g. verify 'detail').
+                r[k] = _MAC_RE.sub(lambda mm: _redact_mac(mm.group(0)), v)
+            else:
+                r[k] = _redact_obj(v)
+        return r
+    if isinstance(o, list):
+        return [_redact_obj(x) for x in o]
+    return o
+
+def _diag_exit_code(cmd, resp):
+    '''Nagios-style: 0 ok, 1 warning, 2 critical, 3 unknown.'''
+    if cmd != 'verify':
+        return 0
+    s = resp.get('summary', {})
+    if s.get('alarming', 0) > 0:
+        return 2
+    if s.get('moderate', 0) > 0:
+        return 1
+    if s.get('unknown', 0) > 0:
+        return 3
+    return 0
+
+def render_status(r, args):
+    print(f"✅ isodhcp {r['version']} on \"{r['iface']}\" "
+          f"(pid {r['pid']}, up {r['uptime_seconds']}s)")
+    print(f"   Server {r['server_ip']}  Pool {r['pool_cidr']}  "
+          f"Isolation: {r['isolation_mode']}")
+    p = r['pool']
+    print(f"   Pool: {p['leased']}/{p['total']} leased "
+          f"({p['utilization_pct']}%), {p['free']} free, "
+          f"{p['free_slash30_blocks']} free /30 blocks, "
+          f"{p['quarantined']} quarantined")
+    c = r['clients']
+    print(f"   Clients: {c['standard']} standard, {c['compat']} compat, "
+          f"{c['playground']} playground")
+    q = r['quarantine']
+    print(f"   Quarantine: {q['count']}/{q['cap']}"
+          f"{'  ⚠️ AT CAP' if q['at_cap'] else ''}")
+    rl = r['ratelimit']
+    print(f"   Rate limiter: {rl['tracked']}/{rl['max']} MACs"
+          f"{'  ⚠️ SATURATED' if rl['saturated'] else ''}")
+    if r.get('playground'):
+        pg = r['playground']
+        print(f"   Playground: {pg['subnet']} gw {pg['gateway']} — "
+              f"{pg['used']} used, {pg['free']} free")
+    print(f"   Socket: {r['socket']}")
+
+def render_config(r, args):
+    print(f"isodhcp {r['version']} configuration ({r['iface']}):")
+    for k in ('server_ip', 'pool_cidr', 'dns_server', 'lease_time',
+              'isolation_mode', 'lease_file', 'socket', 'private_table',
+              'static_count'):
+        print(f"  {k:<15} {r.get(k)}")
+    if r.get('playground'):
+        print(f"  {'playground':<15} {r['playground']['subnet']} "
+              f"(gw {r['playground']['gateway']})")
+    sets = {k: v for k, v in r['nft_sets'].items() if v}
+    if sets:
+        print("  nft sets:")
+        for k, v in sets.items():
+            print(f"    {k:<18} {v}")
+    cls = {k: v for k, v in r['classifier'].items() if v}
+    if cls:
+        print("  classifier rules:")
+        for k, v in cls.items():
+            print(f"    {k:<20} {', '.join(v)}")
+
+def render_dump(r, args):
+    secs = r.get('sections', {})
+    if 'leases' in secs:
+        rows = secs['leases']
+        print(f"LEASES ({len(rows)}):")
+        print(f"  {'MAC':<18} {'IP':<15} {'MODE':<10} {'MASQ':<4} "
+              f"{'EXPIRES':<20} HOSTNAME")
+        for x in rows:
+            exp = 'static' if x['static'] else _fmt_epoch(x['expires_epoch'])
+            print(f"  {x['mac']:<18} {str(x['ip']):<15} {x['mode']:<10} "
+                  f"{'yes' if x['masq'] else 'no':<4} {exp:<20} "
+                  f"{x.get('hostname') or ''}")
+    if 'subnets' in secs:
+        rows = secs['subnets']
+        print(f"\nCOMPAT /30 SUBNETS ({len(rows)}):")
+        for x in rows:
+            print(f"  {x['mac']:<18} gw {x['gateway']:<15} {x['subnet']}")
+    if 'quarantine' in secs:
+        rows = secs['quarantine']
+        print(f"\nQUARANTINE ({len(rows)}):")
+        for x in rows:
+            print(f"  {x['ip']:<15} releases in {x['release_in']}s")
+    if 'ratelimit' in secs:
+        rl = secs['ratelimit']
+        print(f"\nRATE LIMITER: {rl['tracked']}/{rl['max']} tracked, "
+              f"saturated={rl['saturated']}")
+    if 'pool' in secs:
+        p = secs['pool']
+        print(f"\nPOOL: {p['free_count']} free of {p['total']}")
+        preview = ', '.join(p['free_ips'][:64])
+        print(f"  {preview}{' …' if p['free_count'] > 64 else ''}")
+    if 'config' in secs:
+        print()
+        render_config(secs['config'], args)
+    if 'firewall' in secs:
+        print()
+        render_firewall(secs['firewall'], args)
+
+_RTYPE = {1: 'unicast', 2: 'local', 3: 'broadcast', 4: 'anycast',
+          5: 'multicast', 6: 'blackhole'}
+
+def render_firewall(f, args):
+    print(f"ACTUAL FIREWALL/KERNEL STATE (ground truth) for {f['iface']}:")
+    print(f"  private table: {f['private_table']}")
+    hr = f['host_routes_32']
+    print(f"  /32 host routes (main table, unicast): {len(hr)}")
+    if hr:
+        print('    ' + ', '.join(hr))
+    print("  all IPv4 routes on interface (raw):")
+    for r in f['routes_raw']:
+        dst = r['dst'] if r['dst_len'] is None else f"{r['dst']}/{r['dst_len']}"
+        print(f"    {dst:<22} table={r['table']:<4} "
+              f"type={_RTYPE.get(r['type'], r['type'])} proto={r['proto']}")
+    print("  interface IPv4 addresses:")
+    for ip, pfx in f['interface_aliases'].items():
+        print(f"    {ip}/{pfx}")
+    print("  SNAT rules (private table):")
+    snat = f['snat_rules']
+    if isinstance(snat, str):
+        print(f"    {snat}")
+    elif not snat:
+        print("    (none)")
+    else:
+        for daddr, targets in sorted(snat.items()):
+            print(f"    daddr {daddr:<16} -> snat {', '.join(targets)}")
+    print("  configured nft sets (actual elements):")
+    if not f['nft_sets']:
+        print("    (none configured)")
+    for label, s in f['nft_sets'].items():
+        if s.get('error'):
+            print(f"    {label:<18} {s['spec']}: ERROR {s['error']}")
+        else:
+            els = ', '.join(s['elements']) if s['elements'] else '(empty)'
+            print(f"    {label:<18} {s['spec']}: {els}")
+
+def render_show(r, args):
+    print(f"Client {r['mac']}  →  {r['ip']}")
+    if r.get('hostname'):
+        print(f"  hostname   {r['hostname']}")
+    print(f"  mode       {r['mode']}")
+    print(f"  masquerade {'yes' if r['masq'] else 'no'}")
+    print(f"  lease      "
+          f"{'static' if r['static'] else _fmt_epoch(r['expires_epoch'])}")
+    if 'gateway' in r:
+        print(f"  gateway    {r['gateway']}  subnet {r['subnet']}")
+    print("  resources:")
+    for c in r.get('checks', []):
+        if c.get('error'):
+            mark = f"? ({c['error']})"
+        else:
+            mark = '✅ present' if c['present'] else '❌ MISSING'
+        print(f"    {c['resource']:<14} {c['detail']:<30} {mark}")
+
+def render_verify(r, args):
+    s = r['summary']
+    order = {'alarming': 0, 'unknown': 1, 'moderate': 2, 'low': 3}
+    icons = {'alarming': '🔴', 'unknown': '❓', 'moderate': '🟡', 'low': '⚪'}
+    shown = [d for d in r['discrepancies']
+             if getattr(args, 'all', False) or not d['transient']]
+    shown.sort(key=lambda d: order.get(d['severity'], 9))
+    if not shown:
+        print(f"✅ No drift detected "
+              f"({s['transient']} transient discrepancies ignored).")
+    else:
+        for d in shown:
+            t = ' [transient]' if d['transient'] else ''
+            print(f"  {icons.get(d['severity'], '•')} "
+                  f"{d['severity'].upper():<9} {d['resource']}/{d['kind']}: "
+                  f"{d['detail']}{t}")
+    print(f"\nRESULT: {s['alarming']} alarming, {s['moderate']} moderate, "
+          f"{s['low']} low, {s['unknown']} unknown, {s['transient']} transient")
+    if s['alarming'] or s['moderate']:
+        print("Hint: 'systemctl reload isodhcp' (SIGUSR1) reconciles routes, "
+              "aliases and set membership; then re-run --verify.")
+
+def run_client(cmd, args):
+    socket_path = resolve_socket_path(args.interface, explicit=args.socket)
+    payload = {'cmd': cmd}
+    if cmd == 'dump':
+        secs = [s.strip() for s in (args.dump or '').split(',') if s.strip()]
+        if secs:
+            payload['sections'] = secs
+    elif cmd == 'show':
+        payload['key'] = args.show
+    resp, err = diag_query(payload, socket_path)
+    if err:
+        if args.json:
+            print(json.dumps({'status': 'error', 'running': False,
+                              'message': err}))
+        else:
+            print(f'❌ {err}')
+        return 3
+    if resp.get('status') == 'error':
+        if args.json:
+            print(json.dumps(resp, indent=2))
+        else:
+            print(f"❌ {resp.get('message')}")
+        return 3
+    if args.redact:
+        resp = _redact_obj(resp)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+    else:
+        {'status': render_status, 'config': render_config, 'dump': render_dump,
+         'show': render_show, 'verify': render_verify}[cmd](resp, args)
+    return _diag_exit_code(cmd, resp)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -2068,7 +3198,54 @@ if __name__ == '__main__':
         'Format: CODE,TYPE,VALUE. Types: ip, ips, str, int8, int16, int32, '
         'hex. Example: --dhcp-option "42,ip,192.168.1.1"')
 
+    diag = parser.add_argument_group(
+        'Diagnostics (client mode: query a running daemon and exit)')
+    diag.add_argument('--status', action='store_true',
+                      help='Print a health summary of the running daemon.')
+    diag.add_argument('--verify', '--check', dest='verify',
+                      action='store_true',
+                      help='Cross-check the daemon\'s in-memory state against '
+                      'the live kernel routes, interface aliases and nftables '
+                      'sets/SNAT rules it manages, and report any drift. Exit '
+                      'code: 0 clean, 1 warning, 2 critical, 3 unknown.')
+    diag.add_argument('--dump', nargs='?', const='', metavar='SECTIONS',
+                      help='Dump state tables. Optional comma-separated list: '
+                      'leases,subnets,quarantine,ratelimit,pool,config '
+                      '(default: leases,subnets).')
+    diag.add_argument('--show', metavar='MAC|IP|HOSTNAME',
+                      help='Show one client and whether each resource it '
+                      'should own (route/alias/set/SNAT) is actually present.')
+    diag.add_argument('--config', dest='show_config', action='store_true',
+                      help='Print the effective running configuration.')
+    diag.add_argument('--json', action='store_true',
+                      help='Emit diagnostic output as JSON.')
+    diag.add_argument('--redact', action='store_true',
+                      help='Mask MAC addresses and hostnames in diagnostic '
+                      'output.')
+    diag.add_argument('--all', action='store_true',
+                      help='With --verify, also list transient discrepancies.')
+    diag.add_argument('--socket',
+                      help='Path to the diagnostics Unix socket (default: '
+                      'auto-detected in the state directory).')
+
     args = parser.parse_args()
+
+    # Client mode: if a diagnostic action was requested, talk to the running
+    # daemon over its socket and exit. This is the same binary in a different
+    # role, so no privileges or interface access are needed here.
+    client_cmd = None
+    if args.status:
+        client_cmd = 'status'
+    elif args.verify:
+        client_cmd = 'verify'
+    elif args.dump is not None:
+        client_cmd = 'dump'
+    elif args.show:
+        client_cmd = 'show'
+    elif args.show_config:
+        client_cmd = 'config'
+    if client_cmd:
+        sys.exit(run_client(client_cmd, args))
 
     try:
         # Try to set the correct process name, hiding the Python interpreter.
@@ -2191,7 +3368,8 @@ if __name__ == '__main__':
             nft_subnet=args.nft_set_subnet,
             hook_file=args.hook_file,
             isolation_mode=args.isolation,
-            custom_options=custom_options
+            custom_options=custom_options,
+            socket_path=args.socket
         )
         server.start()
     except (KeyboardInterrupt, SystemExit):
