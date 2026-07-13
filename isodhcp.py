@@ -102,7 +102,10 @@ class SystemIntegrator:
     def flush_nft_set(self, set_name):
         '''Empties an NFTables set completely.'''
         if set_name:
-            self.run_cmd(f'nft "flush" element "{set_name}"')
+            # 'flush set' empties a named set; 'flush element' is not valid nft
+            # syntax and silently errored out, so stale entries used to survive
+            # a SIGUSR1 reload instead of being reconciled away.
+            self.run_cmd(f'nft "flush" set "{set_name}"')
 
     def update_client_nft(self, action, ip, mode):
         '''Updates the nftables named set based on client mode'''
