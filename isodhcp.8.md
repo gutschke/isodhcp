@@ -4,6 +4,8 @@ Linux, December 2025
 
 ```
 isodhcp [-i interface] [-s server_ip] [-p pool_cidr] [-d dns_server] [-t lease_time] [-f lease_file] [--static mac=ip[,hostname][,compat][,masquerade][,playground]]... [--dhcp-option CODE,TYPE,VALUE]... [--playground-size n] [--playground-mac mac]... [--playground-oui prefix]... [--playground-vendor string]... [--compat-mac mac]... [--compat-oui prefix]... [--compat-vendor string]... [--masquerade-mac mac]... [--masquerade-oui prefix]... [--masquerade-vendor string]... [--nft-set-playground set_name] [--nft-set-playground-subnet set_name] [--nft-set-isolated set_name] [--nft-set-compat set_name] [--nft-set-gateway set_name] [--nft-set-network set_name] [--nft-set-broadcast set_name] [--nft-set-subnet set_name]... [--hook-file path] [--isolation {on,off,system}]
+
+isodhcp [-i interface] {--status | --verify | --dump[=sections] | --show client | --config} [--json] [--redact] [--all] [--socket path]
 ```
 
 <a name="description"></a>
@@ -142,7 +144,7 @@ firewalling.
   **compat**: (Optional) flag to force this device into legacy or
   compatibility mode.  
   **masquerade**: (Optional) enable source NAT for this client.  
-  playground\R: (Optional) Assign to the shared playground subnet. IP must be
+  **playground**: (Optional) Assign to the shared playground subnet. IP must be
   within the calculated playground range.  
   **Note:**
   For _compat_ entries, the IP must be the ".2" offset of a valid
@@ -179,10 +181,89 @@ firewalling.
   sends all traffic through the layer 3 router. Policy decisions are supposed to
   be enforced by a third-party firewall. **--isolation** provides minimal
   built-in firewall support for the **forward** chain policy:  
-  on\R: DROPs intra-subnet traffic except for playground-to-playground.  
+  **on**: DROPs intra-subnet traffic except for playground-to-playground.  
   **off**: ACCEPTs intra-subnet traffic.  
   **system**: Adds no rules and relies on external firewall.
   
+
+<a name="diagnostics"></a>
+
+# Diagnostics
+
+**isodhcp** is a single binary that runs either as the daemon or as a client
+that inspects an already-running daemon. When one of the actions below is given,
+the process connects to the daemon's socket, prints the answer and exits without
+touching the network or the firewall. This needs no elevated privileges beyond
+access to the socket, and the daemon computes every answer under its own lock,
+so the snapshot is internally consistent and free of races.
+
+The daemon listens on a read-only **AF_UNIX** socket (mode _0600_),
+auto-located in the state directory (see **--socket** and **FILES**). Only the
+user running the daemon and root may connect. The interface given with **-i**
+selects which daemon is queried, so one client can address any of several
+per-interface instances.
+
+
+* **--status**  
+  Print a health summary: pool utilization and the number of free **/30**
+  blocks, client counts by mode, quarantine and rate-limiter saturation,
+  playground occupancy, uptime and the next lease expiry.
+  
+* **--verify**, **--check**  
+  Cross-check the daemon's in-memory model against the live kernel and
+  **nftables** state it manages, and report any drift. Only isodhcp's own
+  footprint is examined: its private table _isodhcp\_&lt;iface&gt;_, the named
+  sets configured with **--nft-set-\***, the in-pool interface aliases, and the
+  in-pool **/32** host routes in the main routing table. Foreign interfaces,
+  address families, routing tables and rules are never inspected, so it is safe
+  on a multi-homed, dual-stack, policy-routed host. Discrepancies are graded
+  _alarming_, _moderate_, _low_ or _unknown_; any that concern a lease which
+  changed mid-check are tagged _transient_ and ignored. The exit status is
+  Nagios-compatible:  
+  **0**: Clean (no drift, or only low/transient findings).  
+  **1**: Warning &mdash; only moderate discrepancies, such as stale entries a
+  reload would clear.  
+  **2**: Critical &mdash; one or more alarming discrepancies (a missing route,
+  alias or SNAT rule for an active lease, a wrong SNAT target, a missing element
+  in a managed set, or an internal index desync).  
+  **3**: Unknown &mdash; the daemon could not be reached, or a managed set/table
+  could not be read.
+  
+* **--dump**[=_sections_]  
+  Dump state tables. _sections_ is an optional comma-separated list of
+  _leases_, _subnets_, _quarantine_, _ratelimit_, _pool_, _config_ and
+  _firewall_ (default: _leases,subnets_). The _firewall_ section is the
+  unfiltered **actual** kernel/nftables state as the daemon sees it &mdash; host
+  routes with their routing table and type, interface addresses, SNAT rules, and
+  the elements of every configured set &mdash; the ground truth to compare
+  against **--verify** and **--dump leases**.
+  
+* **--show** _MAC|IP|HOSTNAME_  
+  Show a single client and, for each resource it should own (host route or
+  gateway alias, set membership, SNAT rule), whether that resource is actually
+  present.
+  
+* **--config**  
+  Print the effective running configuration: addresses, DNS, lease time,
+  isolation mode, socket and private-table names, playground geometry,
+  classifier rules and the configured set names.
+  
+* **--json**  
+  Emit the selected diagnostic as JSON instead of formatted text. Combine with
+  any action above; for **--verify** the exit status is unchanged.
+  
+* **--redact**  
+  Mask MAC addresses and omit hostnames in the output, for pasting into tickets
+  or piping to monitoring.
+  
+* **--all**  
+  With **--verify**, also list discrepancies tagged _transient_.
+  
+* **--socket** _path_  
+  Override the diagnostics socket path. By default the daemon creates, and the
+  client looks for, _isodhcp\_&lt;iface&gt;.sock_ in the systemd _StateDirectory_
+  (_$STATE\_DIRECTORY_), then _/var/lib/isodhcp_, then the current directory.
+
 
 <a name="hook-script"></a>
 
@@ -304,7 +385,13 @@ Run on _guest0_. Treat Nintendo Switch (OUI _98:B6:E9_) and Windows XP
 clients as legacy. Assign a static IP to a client that can't handle /32 routes.
 Populate **NFTables** sets for firewalling:
 
-*     isodhcp -i guest0 &nbsp; --compat-oui 98:B6:E9 &nbsp; --compat-vendor "MSFT 5.0" &nbsp; --static 00:11:22:33:44:55=192.168.2.6,compat,masquerade &nbsp; --nft-set-isolated "inet filter client_iso" &nbsp; --nft-set-compat "inet filter client_legacy" &nbsp; --nft-set-gateway "inet filter local_gateways"
+      isodhcp -i guest0 \
+        --compat-oui 98:B6:E9 \
+        --compat-vendor "MSFT 5.0" \
+        --static 00:11:22:33:44:55=192.168.2.6,compat,masquerade \
+        --nft-set-isolated "inet filter client_iso" \
+        --nft-set-compat "inet filter client_legacy" \
+        --nft-set-gateway "inet filter local_gateways"
 
 
 **8. Hybrid setup with playground**  
@@ -312,7 +399,11 @@ Run on _guest_. Isolate most clients, but provide a 32-IP playground for
 Nintendo Switch consoles (OUI 98:B6:E9) and Apple TVs (Vendor "tvOS").
 Masquerade the consoles. Advertise an NTP server at "192.168.1.1".
 
-*     isodhcp -i guest --playground-size 32 &nbsp; --playground-oui 98:B6:E9 &nbsp; --playground-vendor "tvOS" &nbsp; --masquerade-oui 98:B6:E9 &nbsp; --dhcp-option "42,ip,192.168.1.1"
+      isodhcp -i guest --playground-size 32 \
+        --playground-oui 98:B6:E9 \
+        --playground-vendor "tvOS" \
+        --masquerade-oui 98:B6:E9 \
+        --dhcp-option "42,ip,192.168.1.1"
 
 
 **9. Unifi controller DHCP option**  

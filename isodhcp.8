@@ -31,6 +31,14 @@ isodhcp \- Unnumbered DHCP Server with Client Isolation
 [\fB\-\-nft\-set\-subnet\fR \fIset_name\fR]...
 [\fB\-\-hook\-file\fR \fIpath\fR]
 [\fB\-\-isolation\fR \fI{on,off,system}\fR]
+.PP
+.B isodhcp
+[\fB\-i\fR \fIinterface\fR]
+{\fB\-\-status\fR | \fB\-\-verify\fR | \fB\-\-dump\fR[=\fIsections\fR] | \fB\-\-show\fR \fIclient\fR | \fB\-\-config\fR}
+[\fB\-\-json\fR]
+[\fB\-\-redact\fR]
+[\fB\-\-all\fR]
+[\fB\-\-socket\fR \fIpath\fR]
 .SH DESCRIPTION
 .B isodhcp
 is a specialized DHCP server designed for secure Linux routers hosting guest,
@@ -190,7 +198,7 @@ compatibility mode.
 .br
 \fBmasquerade\fR: (Optional) enable source NAT for this client.
 .br
-\fBplayground\R: (Optional) Assign to the shared playground subnet. IP must be
+\fBplayground\fR: (Optional) Assign to the shared playground subnet. IP must be
 within the calculated playground range.
 .br
 .B Note:
@@ -239,11 +247,101 @@ sends all traffic through the layer 3 router. Policy decisions are supposed to
 be enforced by a third-party firewall. \fB\-\-isolation\fR provides minimal
 built-in firewall support for the \fBforward\fR chain policy:
 .br
-\fBon\R: DROPs intra-subnet traffic except for playground-to-playground.
+\fBon\fR: DROPs intra-subnet traffic except for playground-to-playground.
 .br
 \fBoff\fR: ACCEPTs intra-subnet traffic.
 .br
 \fBsystem\fR: Adds no rules and relies on external firewall.
+
+.SH DIAGNOSTICS
+.B isodhcp
+is a single binary that runs either as the daemon or as a client that inspects
+an already-running daemon. When one of the actions below is given, the process
+connects to the daemon's socket, prints the answer and exits without touching
+the network or the firewall. This needs no elevated privileges beyond access to
+the socket, and the daemon computes every answer under its own lock, so the
+snapshot is internally consistent and free of races.
+
+.PP
+The daemon listens on a read-only \fBAF_UNIX\fR socket (mode \fI0600\fR),
+auto-located in the state directory (see \fB\-\-socket\fR and \fBFILES\fR). Only
+the user running the daemon and root may connect. The interface given with
+\fB\-i\fR selects which daemon is queried, so one client can address any of
+several per-interface instances.
+
+.TP
+.B \-\-status
+Print a health summary: pool utilization and the number of free \fB/30\fR
+blocks, client counts by mode, quarantine and rate-limiter saturation,
+playground occupancy, uptime and the next lease expiry.
+
+.TP
+\fB\-\-verify\fR, \fB\-\-check\fR
+Cross-check the daemon's in-memory model against the live kernel and
+\fBnftables\fR state it manages, and report any drift. Only isodhcp's own
+footprint is examined: its private table \fIisodhcp_<iface>\fR, the named sets
+configured with \fB\-\-nft\-set\-*\fR, the in-pool interface aliases, and the
+in-pool \fB/32\fR host routes in the main routing table. Foreign interfaces,
+address families, routing tables and rules are never inspected, so it is safe on
+a multi-homed, dual-stack, policy-routed host. Discrepancies are graded
+\fIalarming\fR, \fImoderate\fR, \fIlow\fR or \fIunknown\fR; any that concern a
+lease which changed mid-check are tagged \fItransient\fR and ignored. The exit
+status is Nagios-compatible:
+.RS
+.IP 0 4
+Clean (no drift, or only low/transient findings).
+.IP 1
+Warning: only moderate discrepancies, such as stale entries a reload would clear.
+.IP 2
+Critical: one or more alarming discrepancies (a missing route, alias or SNAT
+rule for an active lease, a wrong SNAT target, a missing element in a managed
+set, or an internal index desync).
+.IP 3
+Unknown: the daemon could not be reached, or a managed set/table could not be
+read.
+.RE
+
+.TP
+\fB\-\-dump\fR[=\fIsections\fR]
+Dump state tables. \fIsections\fR is an optional comma-separated list of
+\fIleases\fR, \fIsubnets\fR, \fIquarantine\fR, \fIratelimit\fR, \fIpool\fR,
+\fIconfig\fR and \fIfirewall\fR (default: \fIleases,subnets\fR). The
+\fIfirewall\fR section is the unfiltered \fBactual\fR kernel/nftables state as
+the daemon sees it \(em host routes with their routing table and type, interface
+addresses, SNAT rules, and the elements of every configured set \(em the ground
+truth to compare against \fB\-\-verify\fR and \fB\-\-dump leases\fR.
+
+.TP
+\fB\-\-show\fR \fIMAC|IP|HOSTNAME\fR
+Show a single client and, for each resource it should own (host route or gateway
+alias, set membership, SNAT rule), whether that resource is actually present.
+
+.TP
+.B \-\-config
+Print the effective running configuration: addresses, DNS, lease time, isolation
+mode, socket and private-table names, playground geometry, classifier rules and
+the configured set names.
+
+.TP
+.B \-\-json
+Emit the selected diagnostic as JSON instead of formatted text. Combine with any
+action above; for \fB\-\-verify\fR the exit status is unchanged.
+
+.TP
+.B \-\-redact
+Mask MAC addresses and omit hostnames in the output, for pasting into tickets or
+piping to monitoring.
+
+.TP
+.B \-\-all
+With \fB\-\-verify\fR, also list discrepancies tagged \fItransient\fR.
+
+.TP
+\fB\-\-socket\fR \fIpath\fR
+Override the diagnostics socket path. By default the daemon creates, and the
+client looks for, \fIisodhcp_<iface>.sock\fR in the systemd \fIStateDirectory\fR
+(\fI$STATE_DIRECTORY\fR), then \fI/var/lib/isodhcp\fR, then the current
+directory.
 
 .SH HOOK SCRIPT
 If \fB\-\-hook\-file\fR is specified, the server executes the script
@@ -433,6 +531,12 @@ Assign a printer to 10.100.0.10. Force it to use a /30 subnet (occupying
 .I ./dhcp_leases_{INTERFACE}.json
 The default location for lease persistence. Ensure the user running the daemon
 has write permissions to this file (or directory).
+.TP
+.I <state-dir>/isodhcp_{INTERFACE}.sock
+The read-only diagnostics socket (mode \fI0600\fR) created by the daemon and
+used by client-mode invocations. \fI<state-dir>\fR is the systemd
+\fIStateDirectory\fR if set, otherwise \fI/var/lib/isodhcp\fR or the current
+directory. Overridable with \fB\-\-socket\fR.
 
 .SH SECURITY & PERMISSIONS
 To run \fBisodhcp\fR as an unprivileged user, the process requires the
