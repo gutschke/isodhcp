@@ -69,19 +69,31 @@ class SystemIntegrator:
 
     def update_snat(self, action, client_ip, gateway_ip):
         '''Adds or removes source NAT rules. Ensures no duplicate rules exist.'''
-        # Always attempt to clean up existing rules for this client IP first
+        # Always attempt to clean up existing rules for this client IP first.
+        # Read the chain as JSON under a fixed C locale so rule matching never
+        # depends on nft's (potentially localized) textual output — the handle
+        # and the destination address come straight from structured data.
         try:
             result = subprocess.run(
-                ['nft', '-a', 'list', 'chain', 'ip', self.table_name,
-                 'postrouting'], capture_output=True, text=True, check=True)
-            # Find all handles for this specific client_ip
-            pattern = re.compile(
-                rf'ip\s+daddr\s+{re.escape(client_ip)}\s+.*handle\s+(\d+)')
-            handles = pattern.findall(result.stdout)
-
-            for handle in handles:
-                self.run_cmd(f'nft delete rule ip "{self.table_name}" '
-                             f'postrouting handle "{handle}"')
+                ['nft', '-j', '-a', 'list', 'chain', 'ip', self.table_name,
+                 'postrouting'], capture_output=True, encoding='utf-8',
+                env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}, check=True)
+            data = json.loads(result.stdout)
+            for o in data.get('nftables', []):
+                rule = o.get('rule')
+                if not rule or 'handle' not in rule:
+                    continue
+                daddr = None
+                for e in rule.get('expr', []):
+                    if 'match' in e:
+                        left = e['match'].get('left')
+                        if isinstance(left, dict) and \
+                           left.get('payload', {}).get('field') == 'daddr' \
+                           and e['match'].get('op') == '==':
+                            daddr = e['match'].get('right')
+                if daddr == client_ip:
+                    self.run_cmd(f'nft delete rule ip "{self.table_name}" '
+                                 f'postrouting handle "{rule["handle"]}"')
         except Exception:
             pass
 
