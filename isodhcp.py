@@ -623,10 +623,16 @@ class LeaseManager:
         else:
             self.playground_gateway = str(list(found.hosts())[0])
 
-        # Initialize playground free pool
-        for ip_obj in found.hosts():
+        # Initialize playground free pool. Iterate the whole block, not just
+        # its hosts: the network and broadcast addresses are ordinary members
+        # of the surrounding pool and would otherwise be left behind in it,
+        # allocatable to an isolated client who would then be sitting inside
+        # the permissive playground CIDR. They belong to neither pool.
+        for ip_obj in found:
             s_ip = str(ip_obj)
-            if s_ip == self.playground_gateway:
+            if s_ip == self.playground_gateway or \
+               ip_obj == found.network_address or \
+               ip_obj == found.broadcast_address:
                 if s_ip in self.free_ips: self.free_ips.remove(s_ip)
                 continue
             if s_ip in self.free_ips:
@@ -642,6 +648,27 @@ class LeaseManager:
             self.sys.apply_isolation_policy(str(self.playground_subnet))
             self.sys.update_playground_subnet(
                 'add', str(self.playground_subnet))
+
+    def return_to_pool(self, ip):
+        '''Hands an address back to the pool it was drawn from.
+
+        The playground is carved out of free_ips at startup and kept apart
+        ever since, so the two pools stay disjoint only for as long as every
+        release puts an address back where it came from. A playground address
+        dropped into the main pool shrinks the playground by one and then gets
+        offered to an isolated client -- and the forward chain accepts
+        client-to-client traffic on both sides of the playground CIDR, so that
+        client is silently un-isolated. Infrastructure addresses (the
+        playground's own gateway, network and broadcast) belong to no pool and
+        are simply not handed back.'''
+        addr = ipaddress.IPv4Address(ip)
+        if self.playground_subnet and addr in self.playground_subnet:
+            if ip != self.playground_gateway and \
+               addr != self.playground_subnet.network_address and \
+               addr != self.playground_subnet.broadcast_address:
+                self.playground_free_ips.add(ip)
+        else:
+            self.free_ips.add(ip)
 
     def find_free_slash_30(self):
         '''
@@ -845,12 +872,12 @@ class LeaseManager:
                     # (Re-calculate the block from the stored subnet CIDR)
                     net = ipaddress.IPv4Network(sub_data['subnet'])
                     for x in net:
-                        self.free_ips.add(str(x))
+                        self.return_to_pool(str(x))
                 else:
                     # Standard /32 cleanup
                     if self.sys:
                         self.sys.update_client_nft('delete', ip, mode)
-                    self.free_ips.add(ip)
+                    self.return_to_pool(ip)
 
                 # Remove SRCNAT
                 if is_masq and self.sys:
@@ -934,6 +961,7 @@ class LeaseManager:
                 self.release(mac)
             if self._quarantine(ip, time.time() + 600):
                 self.free_ips.discard(ip)
+                self.playground_free_ips.discard(ip)
                 logger.warning(f'⚠️ Received DECLINE for {ip} from {mac}. '
                                f'Quarantining for 10 min.')
 
@@ -970,7 +998,7 @@ class LeaseManager:
                 del self.quarantine[ip]
                 # Only add back if valid and not assigned static
                 if ip in self.all_possible_ips and ip not in self.ip_to_mac:
-                    self.free_ips.add(ip)
+                    self.return_to_pool(ip)
                     restored_count += 1
 
         # Re-arm the cap alert once the quarantine has drained back under the cap.
