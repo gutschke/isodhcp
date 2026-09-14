@@ -69,6 +69,16 @@ fi
 echo -n 'Copying source files...'
 mkdir -m0755 -p "${dst}"
 for file in "${SOURCES[@]}"; do
+  # The unit is configuration, not code. It carries the --static and
+  # --compat-mac arguments describing this site's devices, which exist nowhere
+  # else and cannot be recovered from this repository, so an upgrade must not
+  # rewrite it. It is also routinely a symlink: into ${dst} by default, or the
+  # other way round when the operator keeps the real file under /etc so the
+  # host's own configuration management can see it. Plain cp follows that link
+  # and would overwrite the real unit with this template, silently and with a
+  # zero exit status. Installing it is handled separately below, and only when
+  # no unit exists at all.
+  [ "${file}" != 'isodhcp.service' ] || continue
   [ ! -e "${src}/${file}" ] || cp "${src}/${file}" "${dst}/"
 done
 echo ' done.'
@@ -116,9 +126,17 @@ chmod 750 "${state_dir}"
 echo ' done.'
 
 echo -n 'Installing systemd service...'
-rm -f '/etc/systemd/system/isodhcp.service'
-# Symlink for "single source of truth" configuration
-ln -s "${dst}/isodhcp.service" '/etc/systemd/system/isodhcp.service'
+unit='/etc/systemd/system/isodhcp.service'
+if [ -e "${unit}" ] || [ -L "${unit}" ]; then
+  # Already present. Leave the unit, and whichever way its symlink points,
+  # exactly as they are -- see the note in the copy loop above. Upgrading the
+  # code is not a reason to discard the operator's device inventory.
+  echo -n ' existing unit kept...'
+else
+  cp "${src}/isodhcp.service" "${dst}/"
+  # Symlink for "single source of truth" configuration
+  ln -s "${dst}/isodhcp.service" "${unit}"
+fi
 
 # Reload
 systemctl daemon-reload

@@ -35,7 +35,18 @@ fi
 
 systemctl stop 'isodhcp' >&/dev/null || :
 systemctl disable 'isodhcp' >&/dev/null || :
-rm -f '/etc/systemd/system/isodhcp.service'
+# Remove the unit only when it is the symlink the installer created. A regular
+# file here means the operator keeps the real unit under /etc, and it carries
+# the --static device inventory for this site -- not reconstructible from this
+# repository, and worth far more than the tidiness of removing it. Leave it,
+# and say so at the end rather than silently.
+unit='/etc/systemd/system/isodhcp.service'
+kept_unit=''
+if [ -L "${unit}" ]; then
+  rm -f "${unit}"
+else
+  [ ! -e "${unit}" ] || kept_unit="${unit}"
+fi
 systemctl daemon-reload
 echo ' done.'
 
@@ -97,3 +108,8 @@ echo ' done.'
 
 echo
 echo 'Uninstall complete.'
+[ -z "${kept_unit}" ] || {
+  echo
+  echo "Kept ${kept_unit} -- it is a regular file, not a symlink, so it holds"
+  echo 'this site'"'"'s device configuration. Remove it by hand if you mean to.'
+}
