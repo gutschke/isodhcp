@@ -1162,12 +1162,32 @@ class LeaseManager:
             if hostname:
                 self.leases[mac]['hostname'] = hostname
             self.ip_to_mac[target_ip] = mac
+
+            # Claim the address out of whichever pool it can still be drawn
+            # from. The dynamic paths above take theirs out as they pick it,
+            # but a static address is handed to us by the operator: it is out
+            # of the main pool from startup and was never out of the playground
+            # rotation at all, and a profile change releases the reservation
+            # and reallocates it in the same breath, which returns it to the
+            # pool and never takes it out again. A leased address left
+            # allocatable is handed to a second client. Claiming it here covers
+            # every path and costs nothing when it is already claimed.
+            self.free_ips.discard(target_ip)
+            self.playground_free_ips.discard(target_ip)
             if subnet_info:
                 # In compat mode we need to store and create the /30 structure
                 self.subnet_leases[mac] = {
                     'gateway': subnet_info[0],
                     'subnet': subnet_info[1]
                 }
+
+                # The whole block, not just the client address: the network,
+                # gateway and broadcast addresses are infrastructure and must
+                # never be allocatable either.
+                try:
+                    for x in ipaddress.IPv4Network(subnet_info[1]):
+                        self.free_ips.discard(str(x))
+                except: pass
 
                 if self.sys:
                     self.sys.add_alias_ip(subnet_info[0], 30)
