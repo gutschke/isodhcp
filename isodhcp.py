@@ -511,6 +511,21 @@ class LeaseManager:
         sorted_macs = sorted(self.static_map.keys())
         for mac in sorted_macs:
             ip, hostname = self.static_map[mac]
+
+            # A lease reloaded from disk may still sit on an address this MAC
+            # has since been re-pointed away from. Committing the reservation
+            # on top of it silently strands the old one: it stays indexed to
+            # this MAC, stays out of the free pool, and keeps whatever /30 it
+            # came with -- for good, because enforce_static_bindings() only
+            # purges a lease whose address disagrees with the reservation, and
+            # by then this one agrees. Let go of the old address first; the
+            # reservation is rebuilt from the operator's configuration below.
+            old = self.leases.get(mac)
+            if old and old['ip'] != ip:
+                logger.info(f'♻️ Releasing {old["ip"]} held by {mac} before '
+                            f'reserving {ip}')
+                self.release(mac)
+
             is_compat = mac in self.compat_macs
             is_masq = mac in self.masq_macs
             if is_compat:
