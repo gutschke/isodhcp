@@ -775,7 +775,7 @@ class LeaseManager:
         disk-reloaded) that carry no 'mode' field. See classify_lease_mode.'''
         return classify_lease_mode(mac, data, self.subnet_leases)
 
-    def release(self, mac):
+    def release(self, mac, force=False):
         with self.cv:
             if mac in self.leases:
                 data = self.leases[mac]
@@ -783,6 +783,31 @@ class LeaseManager:
                 mode = self._effective_mode(mac, data)
                 is_masq = data.get('masq', False)
                 hostname = data.get('hostname', '')
+
+                # A --static binding is operator intent, and it outlives any one
+                # client's idea of its lease state. A device moved to a manually
+                # configured address commonly announces the move with a
+                # DHCPRELEASE, and taking that word as permission to dismantle
+                # the reservation removes the /30 gateway alias the manual
+                # configuration still routes through, drops the client's source
+                # NAT, and -- worst -- returns the reserved addresses to the
+                # pool for the next client that asks. Keep the reservation
+                # exactly as reserve_static_ips() would rebuild it at startup,
+                # and report that nothing was freed: the address is still spoken
+                # for and its host route has to stay. Only a lease sitting on
+                # the reserved address is protected; a static client parked
+                # elsewhere is the conflict the startup reconciliation purges,
+                # and still has to be torn down. `force` is for the one caller
+                # that means it: a profile change, which reallocates from
+                # scratch immediately afterwards.
+                if not force and mac in self.static_map and \
+                   ip == self.static_map[mac][0]:
+                    if data['expires'] != float('inf'):
+                        data['expires'] = float('inf')
+                        self.save_leases()
+                    logger.info(f'📌 Kept static reservation {ip} for {mac} '
+                                f'across release')
+                    return None
 
                 # Check if it was a compat /30 lease
                 if mac in self.subnet_leases:
@@ -989,7 +1014,7 @@ class LeaseManager:
                     logger.info(f'♻️ Config change for {h}{mac} (mode: '
                                 f'{old_mode}->{mode}, masq: {was_masq}->'
                                 f'{is_masq}). Reallocating.')
-                    self.release(mac)
+                    self.release(mac, force=True)
                     # Cleared self.leases, and falls through to allocation
                 else:
                     # Successful renewal

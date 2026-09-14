@@ -156,6 +156,9 @@ firewalling.
   Static entries are initialized immediately at startup. The server configures the
   interface, routes, and firewall rules before the client even connects. These
   addresses are permanently removed from the free pool.
+  A reservation is operator state and a client cannot undo it: a DHCPRELEASE
+  from a statically bound device leaves its addresses, gateway alias and
+  firewall rules in place.
   
 * **--dhcp-option** _CODE,TYPE,VALUE_  
   Inject custom options into DHCP replies.  
