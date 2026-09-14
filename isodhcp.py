@@ -421,6 +421,18 @@ class LeaseManager:
         self.reserve_static_ips()
         self.enforce_static_bindings()
 
+        # Startup has just reconciled the lease table against the
+        # configuration, but nothing above persists the result: load_leases
+        # writes before the static labels are applied, and neither
+        # reserve_static_ips nor enforce_static_bindings writes at all. The
+        # file, not this process's memory, is what downstream consumers read.
+        # So an operator who renames a host and restarts would see the daemon
+        # report the new name while the file still served the old one, until
+        # some unrelated dynamic client happened to trigger a write -- which on
+        # an all-static network never comes. One write here keeps the file and
+        # the running state in agreement from the first moment.
+        self.save_leases()
+
     def sanitize_static_map(self, raw_map):
         '''
         Validates static IPs against the network topology.
