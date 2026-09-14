@@ -942,6 +942,20 @@ class LeaseManager:
                 self.process_quarantine_expiry()
 
             current_time = time.time()
+
+            # A --static label is the operator's choice, and it wins. The lease
+            # record is rebuilt from scratch when the lease is committed below,
+            # so a name that is not reapplied there is simply gone: a client
+            # that sends its own option 12 silently renames the host, and one
+            # that sends none at all erases the name outright. Both are wrong
+            # for a host the operator has deliberately named, because the label
+            # is what DNS goes on to publish. Overriding here rather than at the
+            # commit keeps the log line, the lease record and the hook argument
+            # all describing the same name. Dynamic clients are left alone --
+            # for them option 12 is the only name there is.
+            if mac in self.static_map and self.static_map[mac][1]:
+                hostname = self.static_map[mac][1]
+
             h = f'"{hostname}" ' if hostname else ''
             target_ip = None
             subnet_info = None

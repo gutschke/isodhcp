@@ -140,7 +140,10 @@ firewalling.
   
 * **--static** _mac=ip[,hostname][,compat][,masquerade][,playground]_  
   Map a MAC to a specific IP. Can be repeated.  
-  **hostname**: (Optional) string to log for this device.  
+  **hostname**: (Optional) name for this device. The name is authoritative:
+  it is recorded in the lease and passed to the hook, and it takes
+  precedence over whatever the client asks to be called in DHCP option 12.
+  Clients with no static entry are still named by option 12.  
   **compat**: (Optional) flag to force this device into legacy or
   compatibility mode.  
   **masquerade**: (Optional) enable source NAT for this client.  
