@@ -298,6 +298,8 @@ class RateLimiter:
         self.lock = threading.Lock()
         self._full_alerted = False  # one-shot alert when the table saturates
         self._last_prune = 0.0      # throttles the inline prune when saturated
+        self._limit_logged = 0.0    # throttles the "rate limiting" line...
+        self._limit_unlogged = 0    # ...counting what it did not say
 
     def _prune(self, now):
         '''Drop clients idle for over an hour. Caller must hold self.lock.'''
@@ -350,10 +352,32 @@ class RateLimiter:
             client['last_update'] = now
             client['tokens'] = min(self.burst,
                                    client['tokens'] + (elapsed * self.rate))
+            # Dropping is otherwise silent, which makes a client we dropped
+            # look exactly like one that never asked. Say so once per episode.
+            # The episode only ends when the bucket has refilled completely,
+            # i.e. the client went quiet; re-arming on the next single token
+            # would log at the refill rate for as long as a flood lasts.
+            if client['tokens'] >= self.burst:
+                client.pop('limited', None)
             if client['tokens'] >= 1.0:
                 client['tokens'] -= 1.0
                 return True
             else:
+                if not client.get('limited'):
+                    client['limited'] = True
+                    # Per MAC, but at most one line a second overall, so a
+                    # flood of fresh MACs cannot turn into a flood of log.
+                    if now - self._limit_logged >= 1.0:
+                        more = (f' ({self._limit_unlogged} more MACs limited '
+                                f'since the last report)'
+                                if self._limit_unlogged else '')
+                        logger.warning(f'⚠️ Rate limiting {mac}: dropping its '
+                                       f'DHCP packets until it slows down.'
+                                       f'{more}')
+                        self._limit_logged = now
+                        self._limit_unlogged = 0
+                    else:
+                        self._limit_unlogged += 1
                 return False
 
     def cleanup(self):
