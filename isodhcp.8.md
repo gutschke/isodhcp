@@ -36,6 +36,12 @@ require standard Layer 2 visibility (e.g., Chromecast, Apple TV). Clients in
 the playground share a standard subnet mask (e.g., /26) and can communicate
 with each other, even if global isolation is enforced.
 
+Dynamic addresses are handed out from the top of the pool, which keeps it
+compact for /30 blocks taken from the bottom. The choice is made among the four
+highest free addresses, preferring the one that has been free the longest and
+avoiding any that would break up a whole /30 block, so a just-released address
+is not offered straight back out while an address free for longer is among the
+four. The release history is kept in the lease file.
 
 The server features built-in DoS protection (quarantine), ARP conflict
 detection, and robust integration with **nftables** for high-performance

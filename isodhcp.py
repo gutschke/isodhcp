@@ -1,4 +1,5 @@
 import argparse
+import heapq
 import ipaddress
 import json
 import logging
@@ -27,6 +28,15 @@ logger = logging.getLogger(__name__)
 
 # Disable promiscuous mode to prevent Avahi flapping on interface changes
 conf.sniff_promisc = 0
+
+def _finite_time(v):
+    '''`v` if it is a plausible epoch timestamp from our own lease file,
+    else None. JSON accepts NaN and Infinity, and bool is an int.'''
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if not 0 <= v <= time.time() + 86400:
+        return None
+    return float(v)
 
 class SystemIntegrator:
     def __init__(self, interface, pool_cidr, isolation_mode='system',
@@ -432,6 +442,12 @@ class LeaseManager:
             if ip != self.server_ip:
                 self.all_possible_ips.add(str(ip))
         self.free_ips = self.all_possible_ips.copy()
+        # When each address last went back to a pool (epoch seconds), so that
+        # allocation does not hand a just-freed address straight back out; see
+        # _pick_dynamic. Never-used addresses count as freed at time zero.
+        # Persisted, because a restart is exactly when a whole set of leases
+        # tends to have lapsed together.
+        self.last_freed = {}
         # Bound the quarantine so a device that DECLINE-floods or ARP-claims many pool IPs
         # cannot pin the whole pool out of service. At least half the pool is always kept
         # allocatable; reaching the cap raises a loud one-shot alert.
@@ -699,6 +715,7 @@ class LeaseManager:
                 addr in ipaddress.IPv4Network(d['subnet'])
                 for d in self.subnet_leases.values()):
             return
+        self.last_freed[ip] = time.time()
         if self.playground_subnet and addr in self.playground_subnet:
             if ip != self.playground_gateway and \
                addr != self.playground_subnet.network_address and \
@@ -706,6 +723,58 @@ class LeaseManager:
                 self.playground_free_ips.add(ip)
         else:
             self.free_ips.add(ip)
+
+    # How many of the highest free addresses allocation chooses among. See
+    # _pick_dynamic.
+    REUSE_WINDOW = 4
+
+    def _window_order(self, pool, n):
+        '''The first `n` addresses _pick_dynamic would hand out from `pool`,
+        in order, if nothing else changed in between.'''
+        taken = set()
+
+        def opens_block(ip):
+            # Would taking ip break up an aligned /30 that is still whole?
+            base = int(ipaddress.IPv4Address(ip)) & ~3
+            return all(str(ipaddress.IPv4Address(base + i)) in pool and
+                       str(ipaddress.IPv4Address(base + i)) not in taken
+                       for i in range(4))
+
+        key = lambda ip: (opens_block(ip), self.last_freed.get(ip, 0.0),
+                          -int(ipaddress.IPv4Address(ip)))
+        top = heapq.nlargest(n + self.REUSE_WINDOW - 1, pool,
+                             key=ipaddress.IPv4Address)
+        out = []
+        while top and len(out) < n:
+            pick = min(top[:self.REUSE_WINDOW], key=key)
+            top.remove(pick)
+            taken.add(pick)
+            out.append(pick)
+        return out
+
+    def _pick_dynamic(self, pool):
+        '''The address to hand out next from `pool`, or None.
+
+        Highest first, because that keeps the pool compact: /32 clients fill
+        it from the top while aligned /30 blocks are taken from the bottom,
+        and every address that leaves a hole in between can break up a block
+        a compat client, or a larger mini-subnet, will need later. On a /24
+        that is not a theoretical concern.
+
+        Strictly highest-first has one bad habit, though: whatever was
+        released last is offered again first. That is precisely wrong for a
+        device that never renews and simply keeps using its old address after
+        the lease has lapsed -- its address is the next one given to somebody
+        else, and the two then both answer for it. So the choice is made
+        among the REUSE_WINDOW highest free addresses, taking the one that has
+        been free the longest (never used counts as longest) -- but never one
+        that would break up a /30 block that is still whole, if another in the
+        window would not. A just-freed address is thus not handed out while an
+        address free for longer is in the window -- which on a full pool may
+        be only a few allocations. The window is kept small so that
+        allocation stays close to strict highest-first.'''
+        order = self._window_order(pool, 1)
+        return order[0] if order else None
 
     def find_free_slash_30(self):
         '''
@@ -749,6 +818,13 @@ class LeaseManager:
                 else:
                     expires = data['expires']
 
+                # A lease that lapsed while we were down went free when it
+                # expired, not when we came back.
+                if expires != float('inf') and expires <= now and \
+                   ip in self.all_possible_ips:
+                    self.last_freed[ip] = max(self.last_freed.get(ip, 0.0),
+                                              expires)
+
                 # Only load if valid and valid IP
                 if (expires == float('inf') or expires > now) and \
                    ip in self.all_possible_ips:
@@ -781,6 +857,13 @@ class LeaseManager:
                         loaded_subnets += 1
                     except: pass
             logger.info(f'📁 Loaded {loaded_subnets} active subnets from disk.')
+
+            for ip, r in saved_data.get('released', {}).items():
+                if ip not in self.all_possible_ips or \
+                   not isinstance(r, dict): continue
+                ts = _finite_time(r.get('at'))
+                if ts is None: continue
+                self.last_freed[ip] = max(self.last_freed.get(ip, 0.0), ts)
         except Exception as e:
             logger.error(f'⚠️ Failed to load lease file: {e}')
 
@@ -795,12 +878,30 @@ class LeaseManager:
                 d = data.copy()
                 if d['expires'] == float('inf'): d.pop('expires', None)
                 serializable_leases[mac] = d
-            out = {'leases': serializable_leases, 'subnets': self.subnet_leases}
+            out = {'leases': serializable_leases, 'subnets': self.subnet_leases,
+                   'released': self._released_record()}
             tmp_file = self.lease_file + '.tmp'
             with open(tmp_file, 'w') as f: json.dump(out, f, indent=2)
             os.replace(tmp_file, self.lease_file)
         except Exception as e:
             logger.error(f'Failed to write lease file: {e}')
+
+    # How much allocation history is worth keeping on disk.
+    RELEASED_KEEP = 7 * 86400
+    RELEASED_MAX = 1024
+
+    def _released_record(self):
+        '''Recent release history for the lease file: when each currently free
+        address was freed. Only
+        the most recent RELEASED_MAX within RELEASED_KEEP are kept, so the
+        file does not grow with the pool and is not rewritten in full on
+        every lease change on a large one.'''
+        cutoff = time.time() - self.RELEASED_KEEP
+        recent = heapq.nlargest(
+            self.RELEASED_MAX,
+            ((ts, ip) for ip, ts in self.last_freed.items()
+             if ts >= cutoff and ip not in self.ip_to_mac))
+        return {ip: {'at': round(ts, 1)} for ts, ip in recent}
 
     def enforce_static_bindings(self):
         '''
@@ -1174,9 +1275,9 @@ class LeaseManager:
                             logger.error(f'❌ Playground requested by {mac} '
                                          f'but not configured.')
                             return None
-                        if self.playground_free_ips:
-                            # Pick any free IP from the playground pool
-                            target_ip = self.playground_free_ips.pop()
+                        target_ip = self._pick_dynamic(self.playground_free_ips)
+                        if target_ip:
+                            self.playground_free_ips.discard(target_ip)
                             nft_compat_flag = False
                         else:
                             logger.error(f'❌ Playground pool exhausted.')
@@ -1203,12 +1304,9 @@ class LeaseManager:
                     else:
                         if self.free_ips:
                             for _ in range(5):
-                                if not self.free_ips: break
-                                # Minimize memory fragmentation by picking the
-                                # highest available IP address, leaving the
-                                # bottom pool open for aligned /30 blocks
-                                candidate = max(self.free_ips,
-                                                key=ipaddress.IPv4Address)
+                                # Highest first, mostly; see _pick_dynamic.
+                                candidate = self._pick_dynamic(self.free_ips)
+                                if not candidate: break
                                 self.free_ips.remove(candidate)
                                 if self.is_ip_active_in_arp(candidate):
                                     logger.warning(f'⚠️ IP {candidate} is free '
