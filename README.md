@@ -114,6 +114,20 @@ Or, after installation:
 man isodhcp
 ```
 
+## Tests
+The tests in `tests/` run against `isodhcp.py` without touching the host's
+network: the network is simulated, apart from one test that uses a
+throwaway network namespace (and is skipped where one cannot be created).
+They need the same Python packages as the daemon:
+
+```bash
+python3 -m venv venv && venv/bin/pip3 install pyroute2 scapy
+PYTHON=venv/bin/python tests/run_tests.sh
+```
+
+Each test also runs on its own, and takes the path of an `isodhcp.py` to
+test as an optional argument, so it can be pointed at an older revision.
+
 ## Uninstalling
 To remove the service, user, and files:
 
