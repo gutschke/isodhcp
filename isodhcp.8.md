@@ -344,14 +344,16 @@ come; an entry pinned with a static ARP entry is left alone. Should a reply get
 through anyway, the entry is pointed back at the lessee as soon as the probe is
 over.
 
-The sweep only reports. A reply from anybody other than an address's lessee
-means:
+A reply from anybody other than an address's lessee means:
 
 
-* **A free address:** the next client given it would share it. The log names
-  the **--static** entry that would reserve it for the device, if that is
-  legitimate, and says so if the device is the former holder of a lease that
-  ran out.
+* **A free address:** the next client given it would share it, so allocation
+  passes it over while the device answers and for two sweep intervals after
+  its last reply -- but no more than eight such addresses, or /30 blocks, per
+  allocation, only while there is anything else to offer, and not for a device
+  that answers for more than two of them. The log names the **--static** entry
+  that would reserve the address for the device, if that is legitimate, and
+  says so if the device is the former holder of a lease that ran out.
 * **A leased address:** an IP conflict. The lease itself is left alone: forcing
   a client off its address would let anybody evict any client by answering ARP
   for it, and spoofing ARP is exactly what a man in the middle does. The log

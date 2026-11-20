@@ -463,6 +463,16 @@ class LeaseManager:
         # expired lease is the usual silent squatter, and if it does come back
         # through DHCP it should get the same address again (RFC 2131 4.3.1).
         self.former = {}  # ip -> {'mac': str, 'expired': bool, 'block': cidr}
+        # Unleased addresses the ARP sweep heard a device answer for: ip ->
+        # (mac, when). Allocation avoids them while the answer is recent; see
+        # _busy. In memory only, and empty without a sweep: everything that
+        # goes wrong with it lets the entries age out, which leaves
+        # allocation as it would be without one.
+        self.heard = {}
+        self.heard_for = 0      # how long an answer counts; set by the sweep
+        self._skip_logged = set()
+        self._override_logged = {}
+        self._crowd = []
         # Bound the quarantine so a device that DECLINE-floods or ARP-claims many pool IPs
         # cannot pin the whole pool out of service. At least half the pool is always kept
         # allocatable; reaching the cap raises a loud one-shot alert.
@@ -743,9 +753,9 @@ class LeaseManager:
     # _pick_dynamic.
     REUSE_WINDOW = 4
 
-    def _window_order(self, pool, n):
+    def _window_order(self, pool, n, avoid=()):
         '''The first `n` addresses _pick_dynamic would hand out from `pool`,
-        in order, if nothing else changed in between.'''
+        in order, if nothing else changed in between, leaving out `avoid`.'''
         taken = set()
 
         def opens_block(ip):
@@ -757,7 +767,8 @@ class LeaseManager:
 
         key = lambda ip: (opens_block(ip), self.last_freed.get(ip, 0.0),
                           -int(ipaddress.IPv4Address(ip)))
-        top = heapq.nlargest(n + self.REUSE_WINDOW - 1, pool,
+        top = heapq.nlargest(n + self.REUSE_WINDOW - 1,
+                             (ip for ip in pool if ip not in avoid),
                              key=ipaddress.IPv4Address)
         out = []
         while top and len(out) < n:
@@ -787,9 +798,104 @@ class LeaseManager:
         window would not. A just-freed address is thus not handed out while an
         address free for longer is in the window -- which on a full pool may
         be only a few allocations. The window is kept small so that
-        allocation stays close to strict highest-first.'''
-        order = self._window_order(pool, 1)
-        return order[0] if order else None
+        allocation stays close to strict highest-first.
+
+        Addresses the ARP sweep has recently heard a device answer for are
+        skipped, at most SKIP_MAX of them, and only while something else is
+        left; see _busy.'''
+        pick, busy, avoid = self._next_dynamic(pool)
+        if pick is None:
+            return None
+        # Said once per address and device, for as long as it answers.
+        self._skip_logged = {k for k in self._skip_logged
+                             if busy.get(k[0]) == k[1]}
+        a = ipaddress.IPv4Address(pick)
+        for ip in avoid:
+            if ipaddress.IPv4Address(ip) > a and \
+               (ip, busy[ip]) not in self._skip_logged:
+                self._skip_logged.add((ip, busy[ip]))
+                logger.warning(f'⚠️ Not offering {ip}: {busy[ip]} answered '
+                               f'ARP for it {self._heard_ago(ip)}.')
+        if pick in busy:
+            self._override('pick', f'Handing out {pick} although '
+                           f'{busy[pick]} answered ARP for it '
+                           f'{self._heard_ago(pick)}: nothing else was left '
+                           f'to skip to.')
+        if self._crowd:
+            self._override('crowd', f'Not avoiding the addresses '
+                           f'{", ".join(self._crowd)} answer ARP for: no '
+                           f'device answers for that many without being a '
+                           f'proxy-ARP host or forging replies.')
+        return pick
+
+    def _next_dynamic(self, pool, fallback=True):
+        '''What _pick_dynamic would hand out, without saying anything:
+        (address or None, busy, avoided). Without `fallback`, never a busy
+        address.'''
+        busy = self._busy()
+        avoid = self._avoid(pool, busy)
+        if not fallback:
+            avoid = {ip for ip in busy if ip in pool}
+        order = self._window_order(pool, 1, avoid) or \
+            (self._window_order(pool, 1) if fallback else [])
+        return (order[0] if order else None), busy, avoid
+
+    # Busy addresses allocation skips per pick, and how many busy addresses
+    # one MAC may account for before it looks like proxy ARP or forgery and
+    # is not believed at all.
+    SKIP_MAX = 8
+    HEARD_PER_MAC = 2
+    HEARD_MAX = 64
+
+    def note_heard(self, ip, mac, when):
+        '''The sweep heard `mac` answer ARP for the unleased address `ip`.
+        A MAC already answering for more than it is believed for gets no
+        more room: a proxy must not push real answers out. Caller holds
+        the lock.'''
+        self.heard = {i: (m, t) for i, (m, t) in self.heard.items()
+                      if 0 <= when - t < self.heard_for and i != ip}
+        if sum(m == mac for m, _ in self.heard.values()) > \
+           self.HEARD_PER_MAC:
+            return
+        self.heard[ip] = (mac, when)
+        while len(self.heard) > self.HEARD_MAX:
+            del self.heard[min(self.heard, key=lambda x: self.heard[x][1])]
+
+    def _busy(self):
+        '''ip -> MAC for every address a device answered for within
+        heard_for, unless that MAC answers for more than HEARD_PER_MAC of
+        them. An answer is never cleared by silence, which on a wireless
+        segment proves little; it only ages out. Caller holds the lock.'''
+        now = time.time()
+        # An answer dated in the future (the clock was set back) is not
+        # believed either.
+        live = {ip: m for ip, (m, t) in self.heard.items()
+                if 0 <= now - t < self.heard_for and ip not in self.ip_to_mac}
+        per = {}
+        for m in live.values():
+            per[m] = per.get(m, 0) + 1
+        self._crowd = sorted(m for m, n in per.items()
+                             if n > self.HEARD_PER_MAC)[:4]
+        return {ip: m for ip, m in live.items() if per[m] <= self.HEARD_PER_MAC}
+
+    def _avoid(self, pool, busy):
+        '''The busy addresses of `pool` allocation skips: the SKIP_MAX it
+        would reach first.'''
+        return set(heapq.nlargest(self.SKIP_MAX,
+                                  (ip for ip in busy if ip in pool),
+                                  key=ipaddress.IPv4Address))
+
+    def _heard_ago(self, ip):
+        return f'{(time.time() - self.heard[ip][1]) / 60:.0f} min ago'
+
+    def _override(self, kind, msg):
+        '''Allocation is ignoring what the sweep heard: say so, at most once
+        per heard_for and kind.'''
+        now = time.time()
+        if not 0 <= now - self._override_logged.get(kind, -1e18) < \
+           max(self.heard_for, 60):
+            self._override_logged[kind] = now
+            logger.error(f'🚨 {msg} Possible ARP spoofing; see --verify.')
 
     def _former_address(self, mac, pool):
         '''The address `mac` held most recently, if it is still in `pool`.'''
@@ -806,7 +912,7 @@ class LeaseManager:
         has it (RFC 2131 4.3.1), and take it out of `pool`. Caller holds the
         lock.'''
         ip = self._former_address(mac, pool)
-        if not ip: return None
+        if not ip or self._busy().get(ip, mac) != mac: return None
         pool.discard(ip)
         logger.info(f'♻️ Returning {ip} to its former holder {mac}.')
         return ip
@@ -819,7 +925,9 @@ class LeaseManager:
                             key=lambda kv: -self.last_freed.get(kv[0], 0.0)):
             if f['mac'] != mac or not f.get('block'): continue
             block = [str(x) for x in ipaddress.IPv4Network(f['block'])]
-            if not all(x in self.free_ips for x in block):
+            busy = self._busy()
+            if not all(x in self.free_ips and busy.get(x, mac) == mac
+                       for x in block):
                 continue
             for x in block:
                 self.free_ips.discard(x)
@@ -833,18 +941,30 @@ class LeaseManager:
         to `k` standard ones, up to `k` playground ones, and, unless `k` is
         0, every address of the /30 block a new compat client would get.
         Caller holds the lock.'''
-        out = self._window_order(self.free_ips, k)
-        out += self._window_order(self.playground_free_ips, k)
-        block = self.find_free_slash_30() if k else None
+        busy = self._busy()
+        out = []
+        for pool in (self.free_ips, self.playground_free_ips):
+            avoid = self._avoid(pool, busy)
+            out += self._window_order(pool, k, avoid) or \
+                self._window_order(pool, k)
+        block = self.find_free_slash_30(avoid_busy=True, quiet=True) \
+            if k else None
         if block:
             out += [str(x) for x in block]
         return out
 
-    def find_free_slash_30(self):
+    def find_free_slash_30(self, avoid_busy=False, quiet=False):
         '''
         Scans the pool for a block of 4 IPs (net, gateway, client, broadcast)
         Must be aligned to /30 boundaries (last octet 0, 4, 8, 12...)
+        With `avoid_busy`, skips up to SKIP_MAX blocks the ARP sweep heard a
+        device answer for; see _busy. `quiet` is for looking, not handing
+        out: nothing is logged.
         '''
+        busy = self._busy() if avoid_busy else {}
+        say = (lambda msg: None) if quiet else \
+            (lambda msg: self._override('block', msg))
+        skipped = []
         # Convert set of strings to sorted list of IP objects
         available_ips = sorted([ipaddress.IPv4Address(ip) \
                                 for ip in self.free_ips])
@@ -856,8 +976,24 @@ class LeaseManager:
                 # IPs: .0 (net), .1 (gateway), .2 (client), .3 (broadcast)
                 ips_in_block = [str(x) for x in candidate_net]
                 if all(x in self.free_ips for x in ips_in_block):
+                    hit = [x for x in ips_in_block if x in busy]
+                    if hit and len(skipped) < self.SKIP_MAX:
+                        skipped.append((candidate_net, hit[0]))
+                        continue
+                    if hit:
+                        say(f'Handing out {candidate_net} although '
+                                       f'{busy[hit[0]]} answered ARP for '
+                                       f'{hit[0]} {self._heard_ago(hit[0])}: '
+                                       f'{self.SKIP_MAX} blocks were skipped '
+                                       f'already.')
                     return candidate_net
             except: continue
+        if skipped:
+            net, x = skipped[0]
+            say(f'Handing out {net} although {busy[x]} answered '
+                           f'ARP for {x} {self._heard_ago(x)}: no other /30 '
+                           f'is free.')
+            return net
         return None
 
     def load_leases(self):
@@ -1398,7 +1534,8 @@ class LeaseManager:
                     # Compat /30
                     elif mode == ClientClassifier.MODE_COMPAT:
                         former = self._take_former_block(mac)
-                        subnet = None if former else self.find_free_slash_30()
+                        subnet = None if former else \
+                            self.find_free_slash_30(avoid_busy=True)
                         if former:
                             target_ip, gw, cidr = former
                             subnet_info = (gw, cidr)
@@ -1803,10 +1940,12 @@ class ArpSweeper:
     lease that ran out -- is also asked by unicast, which is acknowledged
     and retried.
 
-    Detection is alert-only: nothing here changes what allocation does.
-    Forcing a lessee off its address would let anybody evict any client by
-    answering ARP for it, and the alerts say as much rather than recommend
-    that the operator do it for them. ARP alone cannot prove that two MACs
+    Detection is alert-only, but for one thing: allocation passes over a
+    free address the sweep has recently heard answer (LeaseManager._busy),
+    which needs nothing but the answer and ages out by itself. Forcing a
+    lessee off its address would let anybody evict any client by answering
+    ARP for it, and the alerts say as much rather than recommend that the
+    operator do it for them. ARP alone cannot prove that two MACs
     are one host, so a second MAC on a leased address is always a conflict;
     when the two answer for each other, the alert offers that explanation,
     and is made once rather than repeated, since that is what a host on two
@@ -1891,6 +2030,9 @@ class ArpSweeper:
         self.log_left = {'error': self.MAX_LOG, 'other': self.MAX_LOG}
         self.unlogged = 0
         self._mine = set()     # this host's addresses, per sweep
+        # Allocation avoids an address for two sweeps after it last answered,
+        # so one missed probe does not end that.
+        lease_mgr.heard_for = 2 * interval + 60
 
     # ------------------------------------------------------------- planning
     def budget(self):
@@ -2152,6 +2294,8 @@ class ArpSweeper:
                 st['unleased'] += 1
                 for m in foreign:
                     st['answered'].setdefault(m, set()).add(ip)
+                    if vacancy:
+                        lm.note_heard(ip, m, self.clock())
             if foreign:
                 st['answering'] += 1
             if not (owner and foreign):
@@ -2326,12 +2470,14 @@ class ArpSweeper:
         mode = lm._effective_mode(owner, lm.leases.get(owner, {}))
         if mode not in st['free']:
             if mode == ClientClassifier.MODE_COMPAT:
-                b = lm.find_free_slash_30()
-                st['free'][mode] = str(list(b)[2]) if b else None
-            elif mode == ClientClassifier.MODE_PLAYGROUND:
-                st['free'][mode] = lm._pick_dynamic(lm.playground_free_ips)
+                b = lm.find_free_slash_30(avoid_busy=True, quiet=True)
+                busy = lm._busy()
+                st['free'][mode] = str(list(b)[2]) if b and not any(
+                    str(x) in busy for x in b) else None
             else:
-                st['free'][mode] = lm._pick_dynamic(lm.free_ips)
+                pg = mode == ClientClassifier.MODE_PLAYGROUND
+                pool = lm.playground_free_ips if pg else lm.free_ips
+                st['free'][mode] = lm._next_dynamic(pool, fallback=False)[0]
         spec = f'--static {owner}={st["free"][mode] or "<a free address>"}'
         name = lm.static_map.get(owner, (None, None))[1]
         if name: spec += f',{name}'
@@ -2410,6 +2556,14 @@ class ArpSweeper:
                          f'which device is legitimate before acting: {owner} '
                          f'holds a valid lease. {fix}')
 
+    def _avoided(self):
+        '''How many free addresses allocation is passing over right now.
+        Caller holds the lease lock.'''
+        lm = self.lm
+        busy = lm._busy()
+        return len(lm._avoid(lm.free_ips, busy)) + \
+            len(lm._avoid(lm.playground_free_ips, busy))
+
     def snapshot(self):
         '''State for the diagnostics socket. Caller holds the lease lock.'''
         return {
@@ -2418,6 +2572,7 @@ class ArpSweeper:
             'full_pool': self.full_pool, 'blind': self.blind,
             'last_sweep': dict(self.last_sweep) if self.last_sweep else None,
             'proxy_macs': sorted(self.proxies),
+            'avoided': self._avoided(),
             'dropped_conflicts': self.dropped_conflicts,
             'conflicts': [{'ip': ip, 'mac': m, 'kind': c['kind'],
                            'owner': c['owner'], 'mutual': c.get('mutual'),
@@ -4291,7 +4446,9 @@ def render_status(r, args):
         if ls and ls.get('flooded'):
             last += f", {ls['flooded']} flooded"
         n = len(a['conflicts'])
-        print(f"   ARP sweep: every {a['interval']}s, {last}"
+        avoided = (f", {a['avoided']} not offered while they answer"
+                   if a.get('avoided') else '')
+        print(f"   ARP sweep: every {a['interval']}s, {last}{avoided}"
               f"{f'  🚨 {n} FINDING(S), see --verify' if n else ''}")
     elif 'arp_sweep' in r:
         print("   ARP sweep: off")
