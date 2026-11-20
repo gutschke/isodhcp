@@ -1157,6 +1157,61 @@ with tempfile.TemporaryDirectory() as td:
           (sw.conflicts.keys(), old, sw.dropped_conflicts))
     restore_time()
 
+print('--- 46. an address that changes hands mid-window is not kept on its old holder ---')
+with tempfile.TemporaryDirectory() as td:
+    old, new = mac(0x4300), mac(0x4301)
+    lm = make_lm(td)
+    ip = lm.allocate_or_renew(old, None, STD)
+    wire = Wire()
+    guarded = []
+    sw = make_sweeper(lm, wire, guard=lambda i, m: guarded.append(
+        (wire.now, m)))
+    real_recv = wire.recv
+    changed = []
+
+    def recv(t):
+        out = real_recv(t)
+        if not changed and wire.now - t0 >= 2:
+            with lm.lock:
+                lm.leases[old]['expires'] = wire.now - 1
+            lm.get_expired_leases()
+            lm.leases.pop(new, None)
+            with lm.lock:
+                lm.free_ips.discard(ip)
+                lm.ip_to_mac[ip] = new
+            changed.append(wire.now)
+        return out
+    sw.recv = recv
+    t0 = wire.now
+    sw.probe(ip, 10.0)
+    check('guarded while it was the lessee',
+          any(m == old and t < changed[0] for t, m in guarded), guarded[:3])
+    check('and not once the address was somebody else\'s',
+          not [t for t, m in guarded if t > changed[0]], guarded[-3:])
+    restore_time()
+
+print('--- 47. a neighbour entry that cannot be written: said once a probe ---')
+with tempfile.TemporaryDirectory() as td:
+    lessee, squatter = mac(0x4400), mac(0x4401)
+    lm = make_lm(td)
+    ip = lm.allocate_or_renew(lessee, None, STD)
+    wire = Wire()
+    wire.answers[ip] = {lessee, squatter}
+    tries = []
+
+    def broken(i, m):
+        tries.append(i)
+        raise OSError('Operation not permitted')
+    sw = make_sweeper(lm, wire, guard=broken)
+    cap.records.clear()
+    heard, _ = sw.probe(ip, 10.0)
+    check('one error, not one per renewal',
+          len(cap.grep('Could not refresh', 'ERROR')) == 1 and
+          len(tries) == 1, (len(tries), cap.records[-3:]))
+    check('and the probe still hears both', set(heard) == {lessee, squatter},
+          heard)
+    restore_time()
+
 print('--- 18. the socket layer sends broadcast and unicast who-has ---')
 sent = []
 

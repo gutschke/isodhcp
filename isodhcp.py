@@ -1857,19 +1857,16 @@ def guard_neighbour(iface_index, ip, mac):
     the lessee's traffic, over. Toggling the state is what makes it a
     change. Without an entry there is nothing to protect: the kernel does
     not create one from a reply. An entry somebody pinned is left alone;
-    replies do not move it anyway.'''
-    try:
-        with IPRoute() as ipr:
-            n = _neighbour(ipr, iface_index, ip)
-            if n is None or n['state'] & (NUD_NOARP | NUD_PERMANENT):
-                return False
-            state = NUD_REACHABLE if n['state'] == NUD_STALE else NUD_STALE
-            ipr.neigh('replace', dst=ip, lladdr=mac, ifindex=iface_index,
-                      state=state)
-            return True
-    except Exception as e:
-        logger.error(f'⚠️ Could not refresh the neighbour entry for {ip}: {e}')
-    return False
+    replies do not move it anyway. Errors are raised: it is called a few
+    times a second, and the caller decides how often to say so.'''
+    with IPRoute() as ipr:
+        n = _neighbour(ipr, iface_index, ip)
+        if n is None or n['state'] & (NUD_NOARP | NUD_PERMANENT):
+            return False
+        state = NUD_REACHABLE if n['state'] == NUD_STALE else NUD_STALE
+        ipr.neigh('replace', dst=ip, lladdr=mac, ifindex=iface_index,
+                  state=state)
+        return True
 
 def restore_neighbour(iface_index, ip, mac):
     '''Point the kernel's neighbour entry for `ip` back at `mac`, if it now
@@ -2142,17 +2139,16 @@ class ArpSweeper:
             psrc = self._sender(ip)
             known = self._known(ip)
             owner = self.lm.ip_to_mac.get(ip)
-        if owner:
-            self.guard(ip, owner)
+        guarding = bool(owner) and self._guard(ip, owner)
         self.send(ip, psrc)
         for m in known:
             self.send(ip, psrc, m)
         heard, flooded = [], False
 
         def listen(t):
-            nonlocal flooded
+            nonlocal flooded, guarding
             while t > 0:
-                s = min(t, self.guard_every) if owner else t
+                s = min(t, self.guard_every) if guarding else t
                 replies, over = self.recv(s)
                 flooded |= over
                 for psrc_, m in replies:
@@ -2162,8 +2158,8 @@ class ArpSweeper:
                         break
                     heard.append(m)
                 t -= s
-                if owner and t > 0:
-                    self.guard(ip, owner)
+                if guarding and t > 0:
+                    guarding = self._guard(ip, owner)
         first = min(self.UNICAST_RETRY, window) if known else 0.0
         if first:
             listen(first)
@@ -2174,6 +2170,23 @@ class ArpSweeper:
         if window > first:
             listen(window - first)
         return heard, flooded
+
+    def _guard(self, ip, owner):
+        '''Guard `owner`'s neighbour entry for `ip` while it still holds the
+        lease: an address that changes hands mid-window must not be kept
+        pointing at its previous holder. Returns whether to go on guarding;
+        a failure is said once per probe, within the log allowance.'''
+        with self.lm.lock:
+            if self.lm.ip_to_mac.get(ip) != owner:
+                return False
+        try:
+            self.guard(ip, owner)
+            return True
+        except Exception as e:
+            with self.lm.lock:
+                self._log(logging.ERROR, f'⚠️ Could not refresh the neighbour '
+                                         f'entry for {ip}: {e}')
+            return False
 
     def _state(self):
         '''Bookkeeping for one sweep's worth of answers.'''
