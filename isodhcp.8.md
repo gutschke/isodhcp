@@ -3,7 +3,7 @@
 Linux, December 2025
 
 ```
-isodhcp [-i interface] [-s server_ip] [-p pool_cidr] [-d dns_server] [-t lease_time] [-f lease_file] [--static mac=ip[,hostname][,compat][,masquerade][,playground]]... [--dhcp-option CODE,TYPE,VALUE]... [--playground-size n] [--playground-mac mac]... [--playground-oui prefix]... [--playground-vendor string]... [--compat-mac mac]... [--compat-oui prefix]... [--compat-vendor string]... [--masquerade-mac mac]... [--masquerade-oui prefix]... [--masquerade-vendor string]... [--nft-set-playground set_name] [--nft-set-playground-subnet set_name] [--nft-set-isolated set_name] [--nft-set-compat set_name] [--nft-set-gateway set_name] [--nft-set-network set_name] [--nft-set-broadcast set_name] [--nft-set-subnet set_name]... [--hook-file path] [--isolation {on,off,system}]
+isodhcp [-i interface] [-s server_ip] [-p pool_cidr] [-d dns_server] [-t lease_time] [-f lease_file] [--static mac=ip[,hostname][,compat][,masquerade][,playground]]... [--dhcp-option CODE,TYPE,VALUE]... [--playground-size n] [--playground-mac mac]... [--playground-oui prefix]... [--playground-vendor string]... [--compat-mac mac]... [--compat-oui prefix]... [--compat-vendor string]... [--masquerade-mac mac]... [--masquerade-oui prefix]... [--masquerade-vendor string]... [--nft-set-playground set_name] [--nft-set-playground-subnet set_name] [--nft-set-isolated set_name] [--nft-set-compat set_name] [--nft-set-gateway set_name] [--nft-set-network set_name] [--nft-set-broadcast set_name] [--nft-set-subnet set_name]... [--hook-file path] [--isolation {on,off,system}] [--arp-sweep-interval seconds] [--arp-sweep-rate n] [--arp-sweep-max n] [--arp-sweep-candidates k] [--arp-sweep-full]
 
 isodhcp [-i interface] {--status | --verify | --dump[=sections] | --show client | --config} [--json] [--redact] [--all] [--socket path]
 ```
@@ -199,6 +199,26 @@ firewalling.
   **off**: ACCEPTs intra-subnet traffic.  
   **system**: Adds no rules and relies on external firewall.
   
+* **--arp-sweep-interval** _seconds_  
+  How often to probe addresses with broadcast ARP to find devices using one
+  without a lease; see **ARP SWEEP** below. Defaults to 900. At least 60, or 0
+  to turn the sweep off.
+  
+* **--arp-sweep-rate** _n_  
+  Never send more than _n_ broadcast ARP probes per second. Defaults to 2; at most 5.
+  
+* **--arp-sweep-max** _n_  
+  Probe at most _n_ addresses per sweep. Defaults to 512.
+  
+* **--arp-sweep-candidates** _k_  
+  Also probe the next _k_ standard and _k_ playground addresses dynamic
+  allocation will hand out, and, unless _k_ is 0, the next /30 block. Defaults
+  to 8.
+  
+* **--arp-sweep-full**  
+  Also trickle through the rest of the pool when it is larger than a /23.
+  Smaller pools always are.
+  
 
 <a name="diagnostics"></a>
 
@@ -277,6 +297,98 @@ per-interface instances.
   Override the diagnostics socket path. By default the daemon creates, and the
   client looks for, _isodhcp\_&lt;iface&gt;.sock_ in the systemd _StateDirectory_
   (_$STATE\_DIRECTORY_), then _/var/lib/isodhcp_, then the current directory.
+
+
+<a name="arp-sweep"></a>
+
+# Arp Sweep
+
+A device that uses an address without holding a lease -- configured
+statically, or still using a lease that has lapsed -- never talks to the DHCP
+server, and may send nothing at all for days. It does answer ARP for its
+address while it is up, even when otherwise idle. So **isodhcp** sends ARP
+requests, strictly within the pool, for, in this order:
+
+
+* every quarantined address, every address with an open finding, and every
+  address whose lease ran out in the last seven days;
+* the addresses dynamic allocation will hand out next
+  (**--arp-sweep-candidates**), and the /30 block a new compat client would get;
+* every leased address, in rotation if they do not all fit;
+* the rest of the pool, a slice per sweep sized for a full pass every four
+  hours as far as the budget allows, if the pool is no larger than a /23 or
+  **--arp-sweep-full** is given.
+
+
+The first two take at most a quarter of a sweep each. Requests are broadcast,
+since a second responder cannot be found otherwise. A device already known to
+claim an address that is not leased -- one with an open finding, or the former
+holder of a lease that ran out -- is also asked by unicast, which a wireless
+network acknowledges and retries where a lost broadcast goes unnoticed. Access
+points that answer ARP on behalf of their clients (proxy ARP, ARP suppression)
+can hide a device they have not learned about.
+
+Each request is sent from an address the server uses on the target's own
+subnet: a compat client's /30 gateway, the playground gateway, or the server
+address. The host's own addresses are asked from 0.0.0.0 instead, so that no
+request ever announces them. Replies from the host's own MACs are ignored for
+its own addresses, and reported for any other.
+
+Replies to a request also reach the kernel, so asking for a leased address
+that a second device answers for can move the kernel's neighbour entry, and
+with it the lessee's traffic, to that device. Nobody but the lessee is asked
+by unicast for a leased address. Just before the probe, and then every half
+lock time (a second by default) until its window closes, the lessee's entry is
+refreshed, which makes Linux ignore other devices' replies however late they
+come; an entry pinned with a static ARP entry is left alone. Should a reply get
+through anyway, the entry is pointed back at the lessee as soon as the probe is
+over.
+
+The sweep only reports. A reply from anybody other than an address's lessee
+means:
+
+
+* **A free address:** the next client given it would share it. The log names
+  the **--static** entry that would reserve it for the device, if that is
+  legitimate, and says so if the device is the former holder of a lease that
+  ran out.
+* **A leased address:** an IP conflict. The lease itself is left alone: forcing
+  a client off its address would let anybody evict any client by answering ARP
+  for it, and spoofing ARP is exactly what a man in the middle does. The log
+  asks the operator to establish which device is legitimate first, and only
+  then names the **--static** options that would separate them. Two MACs that
+  answer for each other's addresses may be one host with two interfaces on the
+  segment (on Linux, net.ipv4.conf.all.arp_ignore=1 stops that). ARP cannot
+  tell that apart from spoofing, so it remains a finding, but it is logged
+  once, as a warning, and **--verify** lists it as low. A lost broadcast does
+  not undo that; it lasts until one side's finding is cleared.
+* **An address the server uses itself** (a /30 gateway, network or broadcast
+  address): a conflict.
+* **A MAC answering for at least eight unleased addresses, and at least half
+  of those probed in a sweep:** a proxy-ARP host, reported as one finding
+  rather than once per address, and still reported for every leased address
+  it answers for.
+
+
+Findings are logged at error level, repeated every six hours, and reported as
+alarming by **--verify** until three probes pass without a reply -- probes
+that could have heard one. A probe whose window overflowed with replies proves
+nothing; **--status** counts those in the last sweep and **--verify** reports
+them. A sweep that probed several lessees without hearing a single one
+is blind: it clears nothing until it hears again, and **--verify** reports that
+state. Nothing the sweep finds is kept across restarts.
+
+The cost is bounded independently of the pool size: at most
+**--arp-sweep-max** addresses per sweep, never more than **--arp-sweep-rate**
+broadcasts per second, spread across **--arp-sweep-interval** with jitter
+rather than sent as a burst; the unicast requests to known responders, a few
+per probe at most, come on top. A wireless segment normally sends every
+broadcast on every radio at the basic rate, waking power-saving clients, which
+is why it matters. A lightly used /24 at the defaults sees roughly one probe
+every fifteen to thirty seconds. Every structure fed by replies is capped too,
+and so is what is logged, errors from an allowance of their own. A socket that
+keeps failing is reopened, and one that cannot be opened is tried again every
+interval.
 
 
 <a name="hook-script"></a>

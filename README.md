@@ -42,6 +42,9 @@ standard subnet mask.
   released, allowing for high-performance firewall rules.
 * **DoS Protection:** Built-in ARP conflict detection and "quarantine" logic
   to prevent rogue devices from exhausting the address pool.
+* **ARP Sweep:** Paced ARP probes of leased, recently lapsed and
+  soon-to-be-offered addresses find devices that use an address without ever
+  asking for it, and raise an actionable alert.
 * **Masquerading:** Optional Source NAT (SNAT) support for clients that
   require traffic to appear as originating from the gateway.
 * **Hook Scripts:** Triggers external scripts on lease changes with full

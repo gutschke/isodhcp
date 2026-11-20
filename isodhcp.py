@@ -4,7 +4,9 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
+import select
 import shlex
 import signal
 import socket
@@ -826,6 +828,18 @@ class LeaseManager:
             return block[2], block[1], f['block']
         return None
 
+    def next_candidates(self, k):
+        '''The addresses dynamic allocation will hand out next, in order: up
+        to `k` standard ones, up to `k` playground ones, and, unless `k` is
+        0, every address of the /30 block a new compat client would get.
+        Caller holds the lock.'''
+        out = self._window_order(self.free_ips, k)
+        out += self._window_order(self.playground_free_ips, k)
+        block = self.find_free_slash_30() if k else None
+        if block:
+            out += [str(x) for x in block]
+        return out
+
     def find_free_slash_30(self):
         '''
         Scans the pool for a block of 4 IPs (net, gateway, client, broadcast)
@@ -1595,6 +1609,850 @@ class LeaseManager:
                 count += 1
             return count
 
+BROADCAST = b'\xff' * 6
+
+def parse_arp_reply(raw, our_mac):
+    '''(sender IP, sender MAC) if `raw` is a well-formed IPv4-over-Ethernet
+    ARP reply to `our_mac` (bytes) from a single station, else None.
+
+    Parsed by hand at fixed offsets rather than through a dissector: every
+    field is attacker-controlled, and a reply whose hardware address is not
+    six bytes must not turn into something that is not a MAC string further
+    down. Some stacks broadcast their replies (RFC 5227 allows it); those
+    count only if addressed to us inside. A group sender address is
+    refused, since it would later be used as a unicast destination.'''
+    if len(raw) < 42 or raw[12:14] != b'\x08\x06':
+        return None
+    # htype 1 (Ethernet), ptype IPv4, hlen 6, plen 4, op 2 (reply)
+    if raw[14:22] != b'\x00\x01\x08\x00\x06\x04\x00\x02':
+        return None
+    if raw[0:6] != our_mac and not (raw[0:6] == BROADCAST and
+                                    raw[32:38] == our_mac):
+        return None
+    sha = raw[22:28]
+    if sha[0] & 1 or sha == b'\x00' * 6:
+        return None
+    return socket.inet_ntoa(raw[28:32]), ':'.join(f'{b:02x}' for b in sha)
+
+def arp_socket_io(iface, server_mac):
+    '''Real I/O for ArpSweeper over one raw socket that only sees ARP
+    replies that could be addressed to us.'''
+    mac_bytes = bytes.fromhex(server_mac.replace(':', ''))
+    sock = conf.L2socket(
+        iface=iface, promisc=False,
+        filter=f'arp and (ether dst {server_mac} or ether broadcast) and '
+               f'arp[0:2] = 1 and arp[2:2] = 0x0800 and arp[4] = 6 and '
+               f'arp[5] = 4 and arp[6:2] = 2')
+
+    def send(ip, psrc, dst=None):
+        sock.send(Ether(dst=dst or 'ff:ff:ff:ff:ff:ff', src=server_mac) /
+                  ARP(op=1, hwsrc=server_mac, psrc=psrc, pdst=ip,
+                      hwdst=dst or '00:00:00:00:00:00'))
+
+    def recv(timeout):
+        '''Replies within `timeout` seconds, and whether there were more
+        than could be read: a window that overflowed proves nothing by
+        silence.'''
+        out = []
+        deadline = time.time() + timeout
+        while len(out) < ArpSweeper.MAX_REPLIES:
+            left = deadline - time.time()
+            if left <= 0: return out, False
+            ready, _, _ = select.select([sock], [], [], left)
+            if not ready: return out, False
+            raw = sock.recv_raw()[1]
+            r = parse_arp_reply(raw, mac_bytes) if raw else None
+            if r: out.append(r)
+        # The rest of a flood is left to the socket buffer, which drops it;
+        # whatever is read later only counts if it answers the probe then
+        # being made.
+        left = deadline - time.time()
+        if left > 0: time.sleep(left)
+        return out, True
+
+    return send, recv
+
+def local_macs():
+    '''Every MAC on this host.'''
+    try:
+        with IPRoute() as ipr:
+            return {dict(l['attrs']).get('IFLA_ADDRESS', '').lower()
+                    for l in ipr.get_links()} - {'', '00:00:00:00:00:00'}
+    except Exception:
+        return set()
+
+def local_addrs():
+    '''Every IPv4 address configured on this host.'''
+    try:
+        with IPRoute() as ipr:
+            return {dict(a['attrs']).get('IFA_ADDRESS')
+                    for a in ipr.get_addr(family=socket.AF_INET)} - {None}
+    except Exception:
+        return set()
+
+NUD_REACHABLE, NUD_STALE, NUD_NOARP, NUD_PERMANENT = 0x02, 0x04, 0x40, 0x80
+
+def _neighbour(ipr, iface_index, ip):
+    '''The kernel's neighbour entry for `ip` on the interface, or None.'''
+    for n in ipr.get_neighbours(dst=ip, family=socket.AF_INET,
+                                ifindex=iface_index):
+        if n['ifindex'] == iface_index:
+            return n
+    return None
+
+def neigh_locktime(iface):
+    '''The interface's neighbour lock time in seconds (the sysctl counts in
+    hundredths), or the kernel default if it cannot be read.'''
+    try:
+        with open(f'/proc/sys/net/ipv4/neigh/{iface}/locktime') as f:
+            return max(0, int(f.read())) / 100
+    except (OSError, ValueError):
+        return 1.0
+
+def guard_neighbour(iface_index, ip, mac):
+    '''Make the kernel's neighbour entry for `ip` name `mac`, as a change it
+    has only just made, if it has an entry at all. Linux lets an ARP reply
+    override an entry only once the entry has gone unchanged for its lock
+    time (a second, by default), so for that long a reply from any other
+    device is ignored; the sweep repeats this more often than that while it
+    listens. Without it, a lessee whose entry is in use answers with no
+    change to make, and whichever other device answers takes the entry, and
+    the lessee's traffic, over. Toggling the state is what makes it a
+    change. Without an entry there is nothing to protect: the kernel does
+    not create one from a reply. An entry somebody pinned is left alone;
+    replies do not move it anyway.'''
+    try:
+        with IPRoute() as ipr:
+            n = _neighbour(ipr, iface_index, ip)
+            if n is None or n['state'] & (NUD_NOARP | NUD_PERMANENT):
+                return False
+            state = NUD_REACHABLE if n['state'] == NUD_STALE else NUD_STALE
+            ipr.neigh('replace', dst=ip, lladdr=mac, ifindex=iface_index,
+                      state=state)
+            return True
+    except Exception as e:
+        logger.error(f'⚠️ Could not refresh the neighbour entry for {ip}: {e}')
+    return False
+
+def restore_neighbour(iface_index, ip, mac):
+    '''Point the kernel's neighbour entry for `ip` back at `mac`, if it now
+    names anybody else. Left STALE, so the kernel confirms it by unicast
+    before relying on it. No entry, or a pinned one, is left as it is.'''
+    try:
+        with IPRoute() as ipr:
+            n = _neighbour(ipr, iface_index, ip)
+            if n is None or n['state'] & (NUD_NOARP | NUD_PERMANENT) or \
+               dict(n['attrs']).get('NDA_LLADDR', '').lower() == mac:
+                return False
+            ipr.neigh('replace', dst=ip, lladdr=mac, ifindex=iface_index,
+                      state=NUD_STALE)
+            return True
+    except Exception as e:
+        logger.error(f'⚠️ Could not restore the neighbour entry for {ip}: {e}')
+        return False
+
+class ArpSweeper:
+    '''Finds addresses that something on the wire uses without a lease.
+
+    DHCP only hears from clients that ask. A device that is configured
+    statically, or that simply carries on using an address after its lease
+    lapsed, never asks -- and it may send nothing at all for days, so there
+    is nothing to overhear either. What it does do, even when otherwise
+    idle, is answer ARP for its address. So the server asks, with a
+    broadcast who-has (a second responder cannot be found with unicast), in
+    this order:
+
+      * whatever is quarantined, or has an open finding, and addresses whose
+        lease ran out in the last few days -- the usual squatter;
+      * the addresses allocation will hand out next;
+      * every leased address, in rotation if they do not all fit;
+      * and, on pools up to a /23 or when asked, the rest of the pool,
+        trickled so that a full pass takes about REST_PERIOD when the budget
+        leaves room for it.
+
+    The first two classes get at most a quarter of each sweep apiece, so
+    neither can starve the rest.
+
+    Every probe is a broadcast, which a wireless segment sends over the air
+    at the basic rate, waking power-saving clients, and that cost must not
+    scale with whatever pool size somebody configures. So it is bounded by
+    construction: at most max_per_sweep probes per sweep, never more than
+    `rate` broadcasts per second, spread across the interval with jitter. A
+    plan that does not fit is trimmed.
+
+    The probes are careful about what they teach other hosts:
+
+      * a request is sent from an address the server uses on the target's
+        own subnet, as the kernel would, so that stacks which ignore
+        off-subnet requesters still answer -- but never from the target
+        itself, which would be a gratuitous announcement. The host's own
+        addresses are probed from 0.0.0.0 (an RFC 5227 probe), which no
+        cache learns from.
+      * replies to a probe reach the kernel as well, so asking a contested
+        leased address can move the kernel's neighbour entry to the other
+        device, and with it the lessee's traffic. Nobody but the lessee is
+        ever asked by unicast for a leased address; its entry is refreshed
+        just before the probe and then every half lock time until the
+        window closes, which makes the kernel ignore other replies, however
+        late they come (guard_neighbour); and should one get through anyway,
+        the entry is pointed back at the lessee as soon as the probe is
+        over.
+
+    Broadcasts are unacknowledged and easily lost on Wi-Fi, so a responder
+    already known -- one with an open finding, or the former holder of a
+    lease that ran out -- is also asked by unicast, which is acknowledged
+    and retried.
+
+    Detection is alert-only: nothing here changes what allocation does.
+    Forcing a lessee off its address would let anybody evict any client by
+    answering ARP for it, and the alerts say as much rather than recommend
+    that the operator do it for them. ARP alone cannot prove that two MACs
+    are one host, so a second MAC on a leased address is always a conflict;
+    when the two answer for each other, the alert offers that explanation,
+    and is made once rather than repeated, since that is what a host on two
+    interfaces looks like for as long as it is up.
+
+    A finding is cleared once its address has been silent for SILENT_SWEEPS
+    probes that could have heard it: not a probe whose window overflowed,
+    and not in a sweep that has stopped hearing even the lessees it probes,
+    which says so and is reported by --verify. A MAC that answers for at
+    least PROXY_MIN unleased addresses and PROXY_FRACTION of those probed is
+    a proxy-ARP host, reported as one finding rather than one per address;
+    it is still reported for any leased address it answers for. The
+    classification has to be earned again every sweep.
+
+    Every structure fed by replies is capped, and so is what is logged,
+    errors and the rest from separate allowances, so that noise cannot
+    crowd out an alert; a full table of findings gives up one on a free
+    address to make room for one on a lease. An alert that could not be
+    logged is tried again at the next sweep.
+
+    `io` returns the (send, recv) pair and is called on the sweeper's own
+    thread when it starts; tests set send and recv directly.'''
+
+    PROXY_MIN = 8
+    PROXY_FRACTION = 0.5
+    SILENT_SWEEPS = 3
+    REMIND = 6 * 3600
+    FULL_POOL_LIMIT = 512   # a /23
+    REST_PERIOD = 4 * 3600
+    LAPSED_FOR = 7 * 86400  # how long a lapsed lease is probed first
+    # A ceiling on --arp-sweep-rate: at 12 Mb/s a broadcast takes well under
+    # a tenth of a millisecond of airtime, so even this is negligible, but a
+    # typo must not turn the sweep into a flood.
+    MAX_RATE = 5.0
+    # Replies read per probe window. A probe is answered by one device, two
+    # in a conflict; anything near this is a flood, which says nothing.
+    MAX_REPLIES = 64
+    MAX_MACS_PER_PROBE = 4
+    MAX_CONFLICTS = 256
+    MAX_PROXIES = 64
+    MAX_LOG = 16            # lines per interval, per allowance
+    # Lessees probed without a single answer before the sweep counts as
+    # deaf: a few may be asleep or gone, all of them means the sweep.
+    BLIND_AFTER = 5
+    UNICAST_RETRY = 1.0     # seconds before asking a known responder again
+    MAX_FAILURES = 10       # probes in a row before the socket is reopened
+
+    def __init__(self, lease_mgr, server_mac, interval=900, rate=2.0,
+                 max_per_sweep=512, candidates=8, full_pool=False, io=None,
+                 own_macs=None, own_addrs=None, restore=None, guard=None,
+                 locktime=1.0, clock=time.time, sleep=time.sleep, rng=None):
+        self.lm = lease_mgr
+        self.server_mac = server_mac.lower()
+        self.interval = interval
+        self.rate = min(rate, self.MAX_RATE)
+        self.max_per_sweep = max_per_sweep
+        self.candidates = candidates
+        self.full_pool = full_pool or \
+            lease_mgr.network.num_addresses <= self.FULL_POOL_LIMIT
+        self.io = io
+        self.own_macs = own_macs or (lambda: set())
+        self.own_addrs = own_addrs or (lambda: set())
+        self.restore = restore or (lambda ip, mac: False)
+        self.guard = guard or (lambda ip, mac: False)
+        # Renewed well within the kernel's lock time; with none at all,
+        # any reply moves the entry and renewing only shortens the damage.
+        self.guard_every = max(0.1, locktime / 2)
+        self.send = self.recv = None
+        self.clock = clock
+        self.sleep = sleep
+        self.rng = rng or random.Random()
+
+        # Everything below is guarded by the lease manager's lock, which the
+        # allocator and the diagnostics thread also take.
+        self.proxies = {}     # mac -> {'since': t, 'answered': n, 'alerted'}
+        self.conflicts = {}   # (ip, mac) -> {kind, owner, held, mutual,
+                              #               first, alerted, silent}
+        self.dropped_conflicts = 0
+        self.cursors = {}
+        self.last_sweep = None
+        self.blind = False
+        self.log_left = {'error': self.MAX_LOG, 'other': self.MAX_LOG}
+        self.unlogged = 0
+        self._mine = set()     # this host's addresses, per sweep
+
+    # ------------------------------------------------------------- planning
+    def budget(self):
+        return max(1, min(self.max_per_sweep,
+                          int(self.interval * 0.9 * self.rate)))
+
+    def _rotate(self, name, items, room):
+        '''Up to `room` of `items`, continuing where the last sweep stopped.'''
+        if len(items) <= room:
+            return list(items)
+        c = self.cursors.get(name, 0) % len(items)
+        self.cursors[name] = c + room
+        return (items[c:] + items[:c])[:room]
+
+    def _lapsed(self):
+        '''Free addresses whose lease ran out recently, most recent first.
+        Caller holds the lease lock.'''
+        lm = self.lm
+        cutoff = self.clock() - self.LAPSED_FOR
+        return sorted((ip for ip, f in lm.former.items()
+                       if f['expired'] and ip not in lm.ip_to_mac and
+                       lm.last_freed.get(ip, 0.0) >= cutoff),
+                      key=lambda ip: -lm.last_freed.get(ip, 0.0))
+
+    def plan(self):
+        '''The addresses to probe this sweep, most important first.'''
+        lm = self.lm
+        key = ipaddress.IPv4Address
+        with lm.lock:
+            suspect = sorted(set(lm.quarantine) |
+                             {ip for ip, _ in self.conflicts}, key=key)
+            classes = [
+                ('suspect', suspect + [ip for ip in self._lapsed()
+                                       if ip not in suspect], 4),
+                ('candidates', lm.next_candidates(self.candidates), 4),
+                ('leased', sorted(lm.ip_to_mac, key=key), 1),
+            ]
+        budget = self.budget()
+        plan, seen = [], set()
+        for name, items, share in classes:
+            items = [ip for ip in items if ip not in seen]
+            room = min(budget - len(plan), max(1, budget // share))
+            for ip in self._rotate(name, items, room):
+                seen.add(ip)
+                plan.append(ip)
+
+        if self.full_pool and len(plan) < budget:
+            net = lm.network
+            n = net.num_addresses
+            quota = min(budget - len(plan),
+                        max(1, -(-n * self.interval // self.REST_PERIOD)))
+            base = int(net.network_address)
+            skip = {str(net.network_address), str(net.broadcast_address)}
+            cursor = self.cursors.get('rest', 0)
+            i = taken = 0
+            while taken < quota and i < n:
+                ip = str(ipaddress.IPv4Address(base + (cursor + i) % n))
+                i += 1
+                if ip in seen or ip in skip: continue
+                seen.add(ip)
+                plan.append(ip)
+                taken += 1
+            self.cursors['rest'] = (cursor + i) % n
+        return plan
+
+    def _sender(self, ip):
+        '''The address to ask from: one this host uses on the target's own
+        subnet, as the kernel would, but never the target itself -- that
+        would be a gratuitous announcement, and an RFC 5227 host squatting on
+        it would defend it to the whole segment. The host's own addresses are
+        asked from 0.0.0.0. Caller holds the lease lock.'''
+        lm = self.lm
+        if ip in self._mine:
+            return '0.0.0.0'
+        a = ipaddress.IPv4Address(ip)
+        for d in lm.subnet_leases.values():
+            if a in ipaddress.IPv4Network(d['subnet']):
+                return d['gateway']
+        if lm.playground_subnet and lm.playground_gateway and \
+           a in lm.playground_subnet:
+            return lm.playground_gateway
+        return str(lm.server_ip)
+
+    def _known(self, ip):
+        '''MACs already known to claim `ip`, to be asked again by unicast.
+        Never anybody for a leased address: a reply from the other device
+        would move the kernel's entry to it, and the lessee answers the
+        broadcast anyway. Caller holds the lease lock.'''
+        lm = self.lm
+        if ip in lm.ip_to_mac:
+            return []
+        known = [m for (i, m) in self.conflicts if i == ip]
+        f = lm.former.get(ip)
+        if f and f['expired'] and unicast_mac(f['mac']) and \
+           f['mac'] not in known:
+            known.append(f['mac'])
+        return known[-self.MAX_MACS_PER_PROBE:]
+
+    # -------------------------------------------------------------- probing
+    def probe(self, ip, window):
+        '''Ask who has `ip`, broadcast and by unicast to anybody known to
+        claim it, listening for `window` seconds. Returns (MACs that
+        answered, in order; whether the window overflowed). For a leased
+        address the lessee's neighbour entry is guarded for the whole
+        window: a device in power save may answer seconds late.'''
+        with self.lm.lock:
+            psrc = self._sender(ip)
+            known = self._known(ip)
+            owner = self.lm.ip_to_mac.get(ip)
+        if owner:
+            self.guard(ip, owner)
+        self.send(ip, psrc)
+        for m in known:
+            self.send(ip, psrc, m)
+        heard, flooded = [], False
+
+        def listen(t):
+            nonlocal flooded
+            while t > 0:
+                s = min(t, self.guard_every) if owner else t
+                replies, over = self.recv(s)
+                flooded |= over
+                for psrc_, m in replies:
+                    if psrc_ != ip or m in heard: continue
+                    if len(heard) >= self.MAX_REPLIES:
+                        flooded = True
+                        break
+                    heard.append(m)
+                t -= s
+                if owner and t > 0:
+                    self.guard(ip, owner)
+        first = min(self.UNICAST_RETRY, window) if known else 0.0
+        if first:
+            listen(first)
+            for m in known:
+                if m not in heard:
+                    self.send(ip, psrc, m)
+        # Listen out the window: it is what paces the sweep.
+        if window > first:
+            listen(window - first)
+        return heard, flooded
+
+    def _state(self):
+        '''Bookkeeping for one sweep's worth of answers.'''
+        return {'own': {self.server_mac} | self.own_macs(), 'obs': {},
+                'answered': {}, 'unleased': 0, 'probed': 0, 'answering': 0,
+                'free': {}, 'also': [], 'leased_probed': 0,
+                'lessees_heard': 0, 'flooded': 0}
+
+    def _refresh_mine(self):
+        lm = self.lm
+        mine = set(self.own_addrs())
+        with lm.lock:
+            mine.add(str(lm.server_ip))
+            mine |= {d['gateway'] for d in lm.subnet_leases.values()}
+            if lm.playground_gateway:
+                mine.add(lm.playground_gateway)
+            self._mine = mine
+
+    def sweep(self):
+        self._refresh_mine()
+        plan = self.plan()
+        started = self.clock()
+        st = self._state()
+        with self.lm.lock:
+            self.dropped_conflicts = 0
+            self.log_left = {'error': self.MAX_LOG, 'other': self.MAX_LOG}
+        budget = self.budget()
+        min_gap = 1.0 / self.rate
+        gap = max(min_gap, self.interval * 0.9 / max(1, len(plan)))
+        done = set()
+        queue = list(plan)
+        failures, reopened = 0, False
+        while queue and st['probed'] < budget:
+            ip = queue.pop(0)
+            if ip in done: continue
+            done.add(ip)
+            wait = max(min_gap, gap * self.rng.uniform(0.75, 1.25))
+            owner = None
+            try:
+                owner = self.evaluate(ip, *self.probe(ip, wait), st)
+                failures = 0
+            except Exception as e:
+                failures += 1
+                with self.lm.lock:
+                    self._log(logging.ERROR,
+                              f'⚠️ ARP probe of {ip} failed: {e}')
+                self.sleep(wait)    # a failing socket must not set the pace
+                if failures >= self.MAX_FAILURES:
+                    # One reopen per sweep; if probing still fails, the next
+                    # sweep tries again.
+                    if reopened or not self._reopen():
+                        break
+                    reopened, failures = True, 0
+            st['probed'] += 1
+            if owner:
+                self._restore(ip, owner)
+            with self.lm.lock:
+                # A host on two interfaces is only recognised as such if the
+                # other side's own address is asked in the same sweep.
+                queue[:0] = [b for b in st['also'] if b not in done]
+                st['also'] = []
+        try:
+            self.finish(st)
+        except Exception as e:
+            logger.error(f'⚠️ ARP sweep evaluation failed: {e}')
+        with self.lm.lock:
+            self.last_sweep = {
+                'started': round(started, 1),
+                'finished': round(self.clock(), 1),
+                'probed': st['probed'], 'answering': st['answering'],
+                'lessees_probed': st['leased_probed'],
+                'lessees_heard': st['lessees_heard'],
+                'flooded': st['flooded'], 'full_pool': self.full_pool}
+        logger.debug(f'📡 ARP sweep: probed {st["probed"]} addresses, '
+                     f'{st["answering"]} answered by a device without a '
+                     f'lease on them; heard {st["lessees_heard"]} of '
+                     f'{st["leased_probed"]} lessees.')
+
+    def _log(self, level, msg):
+        '''Log within this interval's allowance -- errors and everything
+        else from separate ones. Returns whether it was logged. Caller holds
+        the lease lock.'''
+        kind = 'error' if level >= logging.ERROR else 'other'
+        if self.log_left[kind] <= 0:
+            self.unlogged += 1
+            return False
+        self.log_left[kind] -= 1
+        logger.log(level, msg)
+        return True
+
+    def evaluate(self, ip, heard, flooded, st):
+        '''Record the answers to one probe for finish(). Returns the lessee
+        of `ip` if somebody else answered for it, so that its neighbour entry
+        can be pointed back at it at once.'''
+        lm = self.lm
+        with lm.lock:
+            owner = lm.ip_to_mac.get(ip)
+            if owner:
+                st['leased_probed'] += 1
+                if owner in heard:
+                    st['lessees_heard'] += 1
+            # The host's own MACs answer for its own addresses; for any
+            # other address they are as foreign as anybody (proxy ARP, or a
+            # guest sharing the host's MAC).
+            foreign = [m for m in heard if m != owner and
+                       not (ip in self._mine and m in st['own'])]
+            if len(foreign) > self.MAX_MACS_PER_PROBE:
+                self._log(logging.WARNING,
+                          f'⚠️ {len(foreign)} MACs answer ARP for {ip}; '
+                          f'considering only the first '
+                          f'{self.MAX_MACS_PER_PROBE}. Possible ARP spoofing.')
+                foreign = foreign[:self.MAX_MACS_PER_PROBE]
+            vacancy = ip in lm.free_ips or ip in lm.playground_free_ips or \
+                ip in lm.quarantine
+            st['obs'][ip] = (owner, foreign, vacancy, flooded)
+            st['flooded'] += flooded
+            if not owner:
+                st['unleased'] += 1
+                for m in foreign:
+                    st['answered'].setdefault(m, set()).add(ip)
+            if foreign:
+                st['answering'] += 1
+            if not (owner and foreign):
+                return None
+            for m in foreign:
+                b = lm.leases.get(m, {}).get('ip')
+                if b and b not in st['obs']:
+                    st['also'].append(b)
+            return owner
+
+    def _restore(self, ip, owner):
+        '''Point the neighbour entry for `ip` back at its lessee, if it
+        still is the lessee.'''
+        with self.lm.lock:
+            if self.lm.ip_to_mac.get(ip) != owner: return
+        if self.restore(ip, owner):
+            with self.lm.lock:
+                self._log(logging.WARNING,
+                          f'⚠️ Pointed the neighbour entry for {ip} back at '
+                          f'its lessee {owner}; another device had answered '
+                          f'for it.')
+
+    def finish(self, st):
+        '''Decide what a whole sweep's answers mean.'''
+        lm = self.lm
+        now = self.clock()
+        with lm.lock:
+            # Blindness: lessees always answer for their own addresses, so a
+            # sweep that probed a few of them and heard none is not hearing
+            # anything, and its silences must not count.
+            blind = st['leased_probed'] >= self.BLIND_AFTER and \
+                not st['lessees_heard']
+            if blind and not self.blind:
+                self._log(logging.ERROR,
+                          f'🚨 ARP sweep hears no replies, not even from the '
+                          f'{st["leased_probed"]} lessees it probed. No '
+                          f'finding is cleared until it does.')
+            elif self.blind and not blind and st['leased_probed']:
+                self._log(logging.INFO, '✅ ARP sweep hears lessees again.')
+            if st['leased_probed']:
+                self.blind = blind
+
+            # Proxy ARP: re-earned every sweep, judged against how much was
+            # actually probed, so a handful of forged replies cannot get a
+            # real squatter ignored.
+            proxies = {}
+            for m, ips in st['answered'].items():
+                if len(ips) >= self.PROXY_MIN and \
+                   len(ips) >= self.PROXY_FRACTION * st['unleased']:
+                    proxies[m] = len(ips)
+            for m in sorted(proxies)[:self.MAX_PROXIES]:
+                if m not in self.proxies:
+                    self.proxies[m] = {'since': now, 'alerted': None}
+                p = self.proxies[m]
+                p['answered'] = proxies[m]
+                if p['alerted'] is None or now - p['alerted'] >= self.REMIND:
+                    if self._log(logging.ERROR,
+                                 f'🚨 {m} answers ARP for {proxies[m]} '
+                                 f'addresses it holds no lease on, so it is '
+                                 f'acting as a proxy-ARP host, and any client '
+                                 f'it answers for can have its traffic '
+                                 f'intercepted. Find it and turn proxy ARP '
+                                 f'off.'):
+                        p['alerted'] = now
+            for m in [m for m in self.proxies if m not in proxies]:
+                del self.proxies[m]
+                self._log(logging.INFO,
+                          f'✅ {m} no longer behaves like a proxy-ARP host.')
+
+            # Findings: a MAC other than the lessee's answering for a leased
+            # address, for one this host uses itself, or for a free one.
+            seen = {}
+            for ip, (owner, foreign, vacancy, _) in st['obs'].items():
+                for m in foreign:
+                    if lm.ip_to_mac.get(ip) == m:
+                        continue    # it has since been given the address
+                    if not owner and m in self.proxies:
+                        continue    # reported as a proxy instead
+                    held = lm.leases.get(m, {}).get('ip')
+                    back = st['obs'].get(held, (None, []))[1] \
+                        if held else []
+                    if not owner:
+                        kind = 'unleased' if vacancy else 'reserved'
+                    elif m in self.proxies:
+                        kind = 'proxy_arp'
+                    elif m in st['own']:
+                        kind = 'host'
+                    else:
+                        kind = 'conflict'
+                    seen[(ip, m)] = (kind, owner, held,
+                                     bool(owner and held and owner in back))
+
+            for key in list(self.conflicts):
+                ip, m = key
+                if ip not in st['obs'] or key in seen: continue
+                c = self.conflicts[key]
+                owner_changed = st['obs'][ip][0] != c['owner']
+                deaf = self.blind or st['obs'][ip][3]
+                if deaf and not owner_changed: continue
+                c['silent'] += 1
+                if c['silent'] >= self.SILENT_SWEEPS or owner_changed:
+                    del self.conflicts[key]
+                    self._log(logging.INFO,
+                              f'✅ {m} no longer answers ARP for {ip}; '
+                              f'finding cleared.')
+
+            # A device on somebody's lease first: that is traffic going astray
+            # now, and forged noise on free addresses must not crowd it out.
+            order = {'conflict': 0, 'proxy_arp': 0, 'host': 0, 'reserved': 1,
+                     'unleased': 2}
+            for key, (kind, owner, held, mutual) in sorted(
+                    seen.items(), key=lambda kv: (order[kv[1][0]], kv[0])):
+                ip, m = key
+                c = self.conflicts.get(key)
+                if c is None:
+                    if len(self.conflicts) >= self.MAX_CONFLICTS:
+                        # Full: make room by giving up the newest finding of
+                        # a lesser kind, if there is one.
+                        self.dropped_conflicts += 1
+                        less = [k for k, v in self.conflicts.items()
+                                if order[v['kind']] > order[kind]]
+                        if not less:
+                            continue
+                        del self.conflicts[max(less, key=lambda k: (
+                            order[self.conflicts[k]['kind']],
+                            self.conflicts[k]['first']))]
+                    c = self.conflicts[key] = {'first': now, 'alerted': None}
+                # Once the two are seen to answer for each other, one lost
+                # broadcast does not make them strangers: that lasts until
+                # the other side's finding has itself been cleared.
+                if not mutual and c.get('mutual') and \
+                   (c['owner'], c['held']) == (owner, held) and \
+                   (held, owner) in self.conflicts:
+                    mutual = True
+                changed =(c.get('kind'), c.get('owner'), c.get('held'),
+                           c.get('mutual')) != (kind, owner, held, mutual)
+                c.update(kind=kind, owner=owner, held=held, mutual=mutual,
+                         silent=0)
+                # Two MACs answering for each other are said once: repeating
+                # it every few hours for a host that is simply on two
+                # interfaces teaches people to ignore the log.
+                due = c['alerted'] is None or \
+                    (not mutual and now - c['alerted'] >= self.REMIND)
+                if changed or due:
+                    if self._alert(st, ip, m, c):
+                        c['alerted'] = now
+            if self.unlogged and self.log_left['other'] > 0:
+                self.log_left['other'] -= 1
+                logger.warning(f'⚠️ ARP sweep: {self.unlogged} more lines not '
+                               f'logged this interval; see --verify.')
+                self.unlogged = 0
+
+    def _reopen(self):
+        '''Probing keeps failing: open the socket again, since the interface
+        may have been recreated. Returns whether that worked.'''
+        if not self.io:
+            return False
+        try:
+            self.send, self.recv = self.io()
+        except Exception as e:
+            logger.error(f'⚠️ ARP sweep cannot reopen its socket: {e}')
+            return False
+        logger.warning('⚠️ ARP sweep reopened its socket after repeated '
+                       'failures.')
+        return True
+
+    def _suggest(self, st, owner):
+        '''A --static entry that would move the lessee to a free address
+        valid for its mode, keeping its name and options. Computed once per
+        sweep and mode. Caller holds the lease lock.'''
+        lm = self.lm
+        mode = lm._effective_mode(owner, lm.leases.get(owner, {}))
+        if mode not in st['free']:
+            if mode == ClientClassifier.MODE_COMPAT:
+                b = lm.find_free_slash_30()
+                st['free'][mode] = str(list(b)[2]) if b else None
+            elif mode == ClientClassifier.MODE_PLAYGROUND:
+                st['free'][mode] = lm._pick_dynamic(lm.playground_free_ips)
+            else:
+                st['free'][mode] = lm._pick_dynamic(lm.free_ips)
+        spec = f'--static {owner}={st["free"][mode] or "<a free address>"}'
+        name = lm.static_map.get(owner, (None, None))[1]
+        if name: spec += f',{name}'
+        if mode == ClientClassifier.MODE_COMPAT: spec += ',compat'
+        if owner in lm.masq_macs: spec += ',masquerade'
+        if mode == ClientClassifier.MODE_PLAYGROUND: spec += ',playground'
+        return spec
+
+    def _alert(self, st, ip, m, c):
+        '''Log a finding. Returns whether it was logged.'''
+        lm = self.lm
+        owner, kind = c['owner'], c['kind']
+        if kind == 'reserved':
+            return self._log(logging.ERROR,
+                             f'🚨 IP conflict on {ip}: {m} answers ARP for '
+                             f'it, but this server uses it itself (a '
+                             f'gateway, network or broadcast address). '
+                             f'Reconfigure {m}.')
+        if kind == 'unleased':
+            f = lm.former.get(ip)
+            why = (f'; it held a lease on {ip} that ran out and was never '
+                   f'renewed' if f and f['expired'] and f['mac'] == m else '')
+            return self._log(logging.ERROR,
+                             f'🚨 {ip} is free, but {m} answers ARP for '
+                             f'it{why}. The next client given {ip} would '
+                             f'share it with {m}. If {m} is legitimate, '
+                             f'reserve the address for it with --static '
+                             f'{m}={ip} and restart isodhcp; otherwise find '
+                             f'it and reconfigure it to use DHCP.')
+        name = lm.leases.get(owner, {}).get('hostname')
+        o = f'"{name}" {owner}' if name else owner
+        if kind == 'proxy_arp':
+            return self._log(logging.ERROR,
+                             f'🚨 IP conflict on {ip}: proxy-ARP host {m} '
+                             f'answers for it, although it is leased to {o}. '
+                             f'Traffic meant for {owner} can reach {m}.')
+        if kind == 'host':
+            return self._log(logging.ERROR,
+                             f'🚨 IP conflict on {ip}: this host answers ARP '
+                             f'for it through {m}, although it is leased to '
+                             f'{o}. Is proxy_arp enabled, or is a guest '
+                             f'sharing that MAC (ipvlan, macvtap)?')
+        held = c.get('held')
+        spec = self._suggest(st, owner)
+        if c.get('mutual'):
+            return self._log(logging.WARNING,
+                             f'⚠️ {m} answers ARP for {ip}, which is leased '
+                             f'to {o}, and {owner} answers for {held}, which '
+                             f'is leased to {m}. That is what one host with '
+                             f'two interfaces on this segment looks like (on '
+                             f'Linux, net.ipv4.conf.all.arp_ignore=1 stops '
+                             f'it), but ARP cannot tell it apart from '
+                             f'spoofing. Reported once while it lasts.')
+        if held:
+            why = (f'{m} holds {held} itself, and {owner} does not answer for '
+                   f'{held} in return, so this is not one host answering on '
+                   f'two interfaces. It may be ARP spoofing, or a second '
+                   f'address configured on {m}.')
+        else:
+            why = (f'{m} holds no lease here: it is configured statically, '
+                   f'still using a lease that has lapsed, or spoofing ARP.')
+        if owner in lm.static_map:
+            fix = (f'If {m} is legitimate, reconfigure it to use DHCP, or '
+                   f'reserve its address for it with --static {m}={ip} and '
+                   f'move the reservation of {owner}, for example to '
+                   f'{spec}, then restart isodhcp.')
+        else:
+            fix = (f'If {m} is legitimate, reconfigure it to use DHCP, or '
+                   f'reserve its address for it with --static {m}={ip} and '
+                   f'restart isodhcp; {owner} then moves to a free address '
+                   f'at its next renewal (add {spec} to choose which).')
+        return self._log(logging.ERROR,
+                         f'🚨 IP conflict on {ip}: it is leased to {o}, but '
+                         f'{m} also answers ARP for it, so traffic meant for '
+                         f'{owner} can reach {m} instead. {why} Find out '
+                         f'which device is legitimate before acting: {owner} '
+                         f'holds a valid lease. {fix}')
+
+    def snapshot(self):
+        '''State for the diagnostics socket. Caller holds the lease lock.'''
+        return {
+            'interval': self.interval, 'rate': self.rate,
+            'max_per_sweep': self.max_per_sweep, 'budget': self.budget(),
+            'full_pool': self.full_pool, 'blind': self.blind,
+            'last_sweep': dict(self.last_sweep) if self.last_sweep else None,
+            'proxy_macs': sorted(self.proxies),
+            'dropped_conflicts': self.dropped_conflicts,
+            'conflicts': [{'ip': ip, 'mac': m, 'kind': c['kind'],
+                           'owner': c['owner'], 'mutual': c.get('mutual'),
+                           'since': round(c['first'], 1)}
+                          for (ip, m), c in sorted(self.conflicts.items())]}
+
+    def run(self):
+        logger.info(f'📡 ARP sweep: every {self.interval}s, at most '
+                    f'{self.budget()} addresses at up to {self.rate:g}/s'
+                    f'{", whole pool trickled" if self.full_pool else ""}.')
+        failed = False
+        while True:
+            started = self.clock()
+            if self.send is None:
+                try:
+                    self.send, self.recv = self.io()
+                    if failed:
+                        logger.info('✅ ARP sweep opened its socket.')
+                    failed = False
+                except Exception as e:
+                    if not failed:
+                        logger.error(f'⚠️ ARP sweep cannot open its socket, '
+                                     f'retrying every {self.interval}s: {e}')
+                    failed = True
+            if self.send is not None:
+                try:
+                    self.sweep()
+                except Exception as e:
+                    logger.error(f'⚠️ ARP sweep failed: {e}')
+            # Never longer than an interval, should the clock be set back.
+            delay = min(self.interval,
+                        started + self.interval - self.clock())
+            if delay > 0:
+                self.sleep(delay)
+
 def resolve_socket_path(iface, explicit=None, for_daemon=False):
     '''Locate the diagnostics Unix socket for `iface`.
 
@@ -1774,7 +2632,9 @@ class UnnumberedDHCPServer:
                  nft_set_playground_subnet=None, nft_gw=None, nft_net=None,
                  nft_bcast=None, nft_subnet=None, hook_file=None,
                  isolation_mode='system', custom_options=None,
-                 socket_path=None):
+                 socket_path=None, arp_sweep_interval=900,
+                 arp_sweep_rate=2.0, arp_sweep_max=512,
+                 arp_sweep_candidates=8, arp_sweep_full=False):
         self.iface = interface
         self.lease_time = lease_time
         self.lease_file = lease_file
@@ -1889,6 +2749,20 @@ class UnnumberedDHCPServer:
                                       masq_macs=self.masq_macs,
                                       state_change_callback=self.execute_hook,
                                       playground_size=playground_size)
+
+        # Active ARP probing for addresses in use without a lease.
+        self.arp_sweeper = None
+        if arp_sweep_interval > 0:
+            self.arp_sweeper = ArpSweeper(
+                self.lease_mgr, self.server_mac, interval=arp_sweep_interval,
+                rate=arp_sweep_rate, max_per_sweep=arp_sweep_max,
+                candidates=arp_sweep_candidates, full_pool=arp_sweep_full,
+                io=lambda: arp_socket_io(self.iface, self.server_mac),
+                own_macs=local_macs, own_addrs=local_addrs,
+                restore=lambda ip, mac: restore_neighbour(self.if_index, ip,
+                                                          mac),
+                guard=lambda ip, mac: guard_neighbour(self.if_index, ip, mac),
+                locktime=neigh_locktime(self.iface))
 
         # Pre-calculate the "wide" mask (e.g., '255.255.255.0')
         self.wide_netmask = str(self.lease_mgr.network.netmask)
@@ -2755,6 +3629,7 @@ class UnnumberedDHCPServer:
             pg_gw = lm.playground_gateway
             pg_free = len(lm.playground_free_ips)
             next_exp = lm.get_next_expiration()
+            arp = self.arp_sweeper.snapshot() if self.arp_sweeper else None
         with self.limiter.lock:
             rl_tracked = len(self.limiter.clients)
             rl_max = self.limiter.max_clients
@@ -2788,6 +3663,7 @@ class UnnumberedDHCPServer:
                            'at_cap': len(quarantine) >= q_cap},
             'ratelimit': {'tracked': rl_tracked, 'max': rl_max,
                           'saturated': bool(rl_sat)},
+            'arp_sweep': arp,
             'playground': ({'subnet': pg_subnet, 'gateway': pg_gw,
                             'free': pg_free, 'used': playground}
                            if pg_subnet else None),
@@ -2977,6 +3853,7 @@ class UnnumberedDHCPServer:
             pg_subnet = str(lm.playground_subnet) if lm.playground_subnet \
                 else None
             pg_gw = lm.playground_gateway
+            arp = self.arp_sweeper.snapshot() if self.arp_sweeper else None
         snap1 = {m: (d.get('ip'), d.get('expires')) for m, d in leases.items()}
 
         disc = []
@@ -3172,6 +4049,40 @@ class UnnumberedDHCPServer:
             add('low', 'internal', 'quarantine_overlap',
                 f'{ip} is both quarantined and free', ip=ip)
 
+        # F. Devices the ARP sweep found answering for addresses they hold no
+        # lease on. Stays listed until the sweep stops hearing them; two
+        # lessees answering for each other are most likely one host on two
+        # interfaces, so they are listed without raising the alarm.
+        for c in (arp['conflicts'] if arp else []):
+            whose = {'unleased': 'which is free',
+                     'reserved': 'used by this server'}.get(
+                         c['kind'], f"leased to {c['owner']}")
+            what = {'proxy_arp': ' (proxy-ARP host)',
+                    'host': ' (this host)'}.get(c['kind'], '')
+            hint = '; one host on two interfaces?' if c.get('mutual') else ''
+            add('low' if c.get('mutual') else 'alarming', 'arp',
+                'ip_conflict',
+                f"{c['mac']}{what} answers ARP for {c['ip']}, {whose}{hint}; "
+                f"see the log for what to do", ip=c['ip'])
+        for m in (arp['proxy_macs'] if arp else []):
+            add('alarming', 'arp', 'proxy_arp',
+                f"{m} answers ARP for most unleased addresses it is asked "
+                f"about (proxy ARP)", mac=m)
+        if arp and arp['blind']:
+            add('unknown', 'arp', 'blind',
+                'the ARP sweep hears no replies, not even from lessees; '
+                'no finding is cleared until it does')
+        flooded = ((arp or {}).get('last_sweep') or {}).get('flooded')
+        if flooded:
+            add('moderate', 'arp', 'flooded',
+                f"{flooded} probes of the last ARP sweep drew more replies "
+                f"than are read; an answer from a squatter may have been "
+                f"missed (possible ARP spoofing)")
+        if arp and arp['dropped_conflicts']:
+            add('alarming', 'arp', 'conflicts_dropped',
+                f"{arp['dropped_conflicts']} further conflicts were not "
+                f"tracked (cap reached); possible ARP spoofing")
+
         # 4. Tag discrepancies for leases that changed during the read as
         # transient (racy snapshot, not real drift).
         with lm.lock:
@@ -3227,6 +4138,8 @@ class UnnumberedDHCPServer:
         self.sync_interface_addresses()
         self.lease_mgr.reapply_system_state()
         self.sync_kernel_routes()
+        if self.arp_sweeper:
+            threading.Thread(target=self.arp_sweeper.run, daemon=True).start()
         sniff(iface=self.iface, filter='udp and (port 67 or port 68)',
               prn=self.handle_dhcp, store=0)
 
@@ -3334,6 +4247,8 @@ def _redact_obj(o):
         return r
     if isinstance(o, list):
         return [_redact_obj(x) for x in o]
+    if isinstance(o, str):
+        return _MAC_RE.sub(lambda mm: _redact_mac(mm.group(0)), o)
     return o
 
 def _diag_exit_code(cmd, resp):
@@ -3368,6 +4283,18 @@ def render_status(r, args):
     rl = r['ratelimit']
     print(f"   Rate limiter: {rl['tracked']}/{rl['max']} MACs"
           f"{'  ⚠️ SATURATED' if rl['saturated'] else ''}")
+    a = r.get('arp_sweep')
+    if a:
+        ls = a['last_sweep']
+        last = (f"last probed {ls['probed']}, {ls['answering']} in use "
+                f"without a lease" if ls else 'first sweep in progress')
+        if ls and ls.get('flooded'):
+            last += f", {ls['flooded']} flooded"
+        n = len(a['conflicts'])
+        print(f"   ARP sweep: every {a['interval']}s, {last}"
+              f"{f'  🚨 {n} FINDING(S), see --verify' if n else ''}")
+    elif 'arp_sweep' in r:
+        print("   ARP sweep: off")
     if r.get('playground'):
         pg = r['playground']
         print(f"   Playground: {pg['subnet']} gw {pg['gateway']} — "
@@ -3507,7 +4434,8 @@ def render_verify(r, args):
                   f"{d['detail']}{t}")
     print(f"\nRESULT: {s['alarming']} alarming, {s['moderate']} moderate, "
           f"{s['low']} low, {s['unknown']} unknown, {s['transient']} transient")
-    if s['alarming'] or s['moderate']:
+    if any(d['resource'] != 'arp' for d in shown
+           if d['severity'] in ('alarming', 'moderate')):
         print("Hint: 'systemctl reload isodhcp' (SIGUSR1) reconciles routes, "
               "aliases and set membership; then re-run --verify.")
 
@@ -3630,6 +4558,26 @@ if __name__ == '__main__':
     parser.add_argument('--isolation', choices=['on', 'off', 'system'],
                         default='system',
                         help='Enforce client-to-client isolation policy')
+    parser.add_argument(
+        '--arp-sweep-interval', type=int, default=900, metavar='SECONDS',
+        help='Probe leased, recently lapsed and next-to-be-allocated '
+        'addresses with ARP this often, to find devices using an address '
+        'without a lease. 0 turns it off.')
+    parser.add_argument(
+        '--arp-sweep-rate', type=float, default=2.0, metavar='PER_SECOND',
+        help=f'Never send broadcast ARP probes faster than this (at most '
+        f'{ArpSweeper.MAX_RATE:g}).')
+    parser.add_argument(
+        '--arp-sweep-max', type=int, default=512, metavar='N',
+        help='Probe at most this many addresses per sweep.')
+    parser.add_argument(
+        '--arp-sweep-candidates', type=int, default=8, metavar='K',
+        help='Also probe the next K standard and K playground addresses '
+        'allocation will hand out, and, unless K is 0, the next /30 block.')
+    parser.add_argument(
+        '--arp-sweep-full', action='store_true',
+        help='Also trickle through the rest of the pool when it is larger '
+        'than a /23 (smaller pools always are).')
     parser.add_argument(
         '--dhcp-option', action='append', help='Add custom DHCP option. '
         'Format: CODE,TYPE,VALUE. Types: ip, ips, str, int8, int16, int32, '
@@ -3771,6 +4719,19 @@ if __name__ == '__main__':
                              f'allocation of 8 IPs.')
              sys.exit(1)
 
+    # The sweep sends broadcasts, so its limits are not negotiable.
+    if args.arp_sweep_interval != 0 and args.arp_sweep_interval < 60:
+        logger.critical('⚠️ --arp-sweep-interval must be 0 (off) or >= 60.')
+        sys.exit(1)
+    if not 0 < args.arp_sweep_rate <= ArpSweeper.MAX_RATE:
+        logger.critical(f'⚠️ --arp-sweep-rate must be > 0 and <= '
+                        f'{ArpSweeper.MAX_RATE:g}.')
+        sys.exit(1)
+    if args.arp_sweep_max < 1 or args.arp_sweep_candidates < 0:
+        logger.critical('⚠️ --arp-sweep-max must be >= 1 and '
+                        '--arp-sweep-candidates >= 0.')
+        sys.exit(1)
+
     # Parse custom DHCP options
     custom_options = parse_custom_options(args.dhcp_option)
 
@@ -3806,7 +4767,12 @@ if __name__ == '__main__':
             hook_file=args.hook_file,
             isolation_mode=args.isolation,
             custom_options=custom_options,
-            socket_path=args.socket
+            socket_path=args.socket,
+            arp_sweep_interval=args.arp_sweep_interval,
+            arp_sweep_rate=args.arp_sweep_rate,
+            arp_sweep_max=args.arp_sweep_max,
+            arp_sweep_candidates=args.arp_sweep_candidates,
+            arp_sweep_full=args.arp_sweep_full
         )
         server.start()
     except (KeyboardInterrupt, SystemExit):

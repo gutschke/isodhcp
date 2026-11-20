@@ -31,6 +31,11 @@ isodhcp \- Unnumbered DHCP Server with Client Isolation
 [\fB\-\-nft\-set\-subnet\fR \fIset_name\fR]...
 [\fB\-\-hook\-file\fR \fIpath\fR]
 [\fB\-\-isolation\fR \fI{on,off,system}\fR]
+[\fB\-\-arp\-sweep\-interval\fR \fIseconds\fR]
+[\fB\-\-arp\-sweep\-rate\fR \fIn\fR]
+[\fB\-\-arp\-sweep\-max\fR \fIn\fR]
+[\fB\-\-arp\-sweep\-candidates\fR \fIk\fR]
+[\fB\-\-arp\-sweep\-full\fR]
 .PP
 .B isodhcp
 [\fB\-i\fR \fIinterface\fR]
@@ -268,6 +273,31 @@ built-in firewall support for the \fBforward\fR chain policy:
 .br
 \fBsystem\fR: Adds no rules and relies on external firewall.
 
+.TP
+\fB\-\-arp\-sweep\-interval\fR \fIseconds\fR
+How often to probe addresses with broadcast ARP to find devices using one
+without a lease; see \fBARP SWEEP\fR below. Defaults to 900. At least 60, or 0
+to turn the sweep off.
+
+.TP
+\fB\-\-arp\-sweep\-rate\fR \fIn\fR
+Never send more than \fIn\fR broadcast ARP probes per second. Defaults to 2; at most 5.
+
+.TP
+\fB\-\-arp\-sweep\-max\fR \fIn\fR
+Probe at most \fIn\fR addresses per sweep. Defaults to 512.
+
+.TP
+\fB\-\-arp\-sweep\-candidates\fR \fIk\fR
+Also probe the next \fIk\fR standard and \fIk\fR playground addresses
+dynamic allocation will hand out, and, unless \fIk\fR is 0, the next /30
+block. Defaults to 8.
+
+.TP
+\fB\-\-arp\-sweep\-full\fR
+Also trickle through the rest of the pool when it is larger than a /23.
+Smaller pools always are.
+
 .SH DIAGNOSTICS
 .B isodhcp
 is a single binary that runs either as the daemon or as a client that inspects
@@ -357,6 +387,102 @@ Override the diagnostics socket path. By default the daemon creates, and the
 client looks for, \fIisodhcp_<iface>.sock\fR in the systemd \fIStateDirectory\fR
 (\fI$STATE_DIRECTORY\fR), then \fI/var/lib/isodhcp\fR, then the current
 directory.
+
+.SH ARP SWEEP
+A device that uses an address without holding a lease \(em configured
+statically, or still using a lease that has lapsed \(em never talks to the
+DHCP server, and may send nothing at all for days. It does answer ARP for its
+address while it is up, even when otherwise idle. So \fBisodhcp\fR sends ARP
+requests, strictly within the pool, for, in this order:
+.RS
+.IP \- 2
+every quarantined address, every address with an open finding, and every
+address whose lease ran out in the last seven days;
+.IP \- 2
+the addresses dynamic allocation will hand out next
+(\fB\-\-arp\-sweep\-candidates\fR), and the /30 block a new compat client would
+get;
+.IP \- 2
+every leased address, in rotation if they do not all fit;
+.IP \- 2
+the rest of the pool, a slice per sweep sized for a full pass every four
+hours as far as the budget allows, if the pool is no larger than a /23 or
+\fB\-\-arp\-sweep\-full\fR is given.
+.RE
+.PP
+The first two take at most a quarter of a sweep each. Requests are broadcast,
+since a second responder cannot be found otherwise. A device already known to
+claim an address that is not leased \(em one with an open finding, or the
+former holder of a lease that ran out \(em is also asked by unicast, which a
+wireless network acknowledges and retries where a lost broadcast goes
+unnoticed. Access points that answer ARP on behalf of their clients (proxy ARP,
+ARP suppression) can hide a device they have not learned about.
+.PP
+Each request is sent from an address the server uses on the target's own
+subnet: a compat client's /30 gateway, the playground gateway, or the server
+address. The host's own addresses are asked from 0.0.0.0 instead, so that no
+request ever announces them. Replies from the host's own MACs are ignored for
+its own addresses, and reported for any other.
+.PP
+Replies to a request also reach the kernel, so asking for a leased address
+that a second device answers for can move the kernel's neighbour entry, and
+with it the lessee's traffic, to that device. Nobody but the lessee is asked
+by unicast for a leased address. Just before the probe, and then every half
+lock time (a second by default) until its window closes, the lessee's entry is
+refreshed, which makes Linux ignore other devices' replies however late they
+come; an entry pinned with a static ARP entry is left alone. Should a reply get
+through anyway, the entry is pointed back at the lessee as soon as the probe is
+over.
+.PP
+The sweep only reports. A reply from anybody other than an address's lessee
+means:
+.RS
+.IP \- 2
+\fBA free address:\fR the next client given it would share it. The log names
+the \fB\-\-static\fR entry that would reserve it for the device, if that is
+legitimate, and says so if the device is the former holder of a lease that ran
+out.
+.IP \- 2
+\fBA leased address:\fR an IP conflict. The lease itself is left alone: forcing
+a client off its address would let anybody evict any client by answering ARP
+for it, and spoofing ARP is exactly what a man in the middle does. The log asks
+the operator to establish which device is legitimate first, and only then names
+the \fB\-\-static\fR options that would separate them. Two MACs that answer for
+each other's addresses may be one host with two interfaces on the segment (on
+Linux, net.ipv4.conf.all.arp_ignore=1 stops that). ARP cannot tell that apart
+from spoofing, so it remains a finding, but it is logged once, as a warning,
+and \fB\-\-verify\fR lists it as low. A lost broadcast does not undo that;
+it lasts until one side's finding is cleared.
+.IP \- 2
+\fBAn address the server uses itself\fR (a /30 gateway, network or broadcast
+address): a conflict.
+.IP \- 2
+\fBA MAC answering for at least eight unleased addresses, and at least half of
+those probed in a sweep:\fR a proxy-ARP host, reported as one finding rather
+than once per address, and still reported for every leased address it answers
+for.
+.RE
+.PP
+Findings are logged at error level, repeated every six hours, and reported as
+alarming by \fB\-\-verify\fR until three probes pass without a reply \(em
+probes that could have heard one. A probe whose window overflowed with replies
+proves nothing; \fB\-\-status\fR counts those in the last sweep and
+\fB\-\-verify\fR reports them. A sweep that probed several lessees without
+hearing a single one is blind: it clears nothing until it hears again, and
+\fB\-\-verify\fR reports that state. Nothing the sweep finds is kept across
+restarts.
+.PP
+The cost is bounded independently of the pool size: at most
+\fB\-\-arp\-sweep\-max\fR addresses per sweep, never more than
+\fB\-\-arp\-sweep\-rate\fR broadcasts per second, spread across
+\fB\-\-arp\-sweep\-interval\fR with jitter rather than sent as a burst; the
+unicast requests to known responders, a few per probe at most, come on top. A
+wireless segment normally sends every broadcast on every radio at the basic
+rate, waking power-saving clients, which is why it matters. A lightly used /24
+at the defaults sees roughly one probe every fifteen to thirty seconds. Every
+structure fed by replies is capped too, and so is what is logged, errors from
+an allowance of their own. A socket that keeps failing is reopened, and one
+that cannot be opened is tried again every interval.
 
 .SH HOOK SCRIPT
 If \fB\-\-hook\-file\fR is specified, the server executes the script
