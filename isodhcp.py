@@ -545,16 +545,22 @@ class LeaseManager:
                     # infrastructure.
                     if x in self.ip_to_mac and self.ip_to_mac[x] != mac:
                         conflict_mac = self.ip_to_mac[x]
+                        h = f'"{hostname}" ' if hostname else ''
                         logger.warning(f'⚠️ Evicting dynamic lease {x} '
                                        f'({conflict_mac}) to make room for '
-                                       f'static /30')
+                                       f'static /30 of {h}{mac}')
                         self.release(conflict_mac)
                     if x in self.free_ips: self.free_ips.remove(x)
                 self.subnet_leases[mac] = {'gateway': gw, 'subnet': subnet_cidr}
             else:
                 # Standard mode /32
                 if ip in self.ip_to_mac and self.ip_to_mac[ip] != mac:
-                    self.release(self.ip_to_mac[ip])
+                    conflict_mac = self.ip_to_mac[ip]
+                    h = f'"{hostname}" ' if hostname else ''
+                    logger.warning(f'⚠️ Evicting dynamic lease {ip} '
+                                   f'({conflict_mac}) to make room for '
+                                   f'static {h}{mac}')
+                    self.release(conflict_mac)
                 if ip in self.free_ips: self.free_ips.remove(ip)
                 self.subnet_leases.pop(mac, None)
             # Commit permanent lease
@@ -1626,6 +1632,25 @@ class UnnumberedDHCPServer:
             nft_set_gw=nft_gw, nft_set_net=nft_net, nft_set_bcast=nft_bcast,
             nft_set_subnet=nft_subnet)
 
+        # Script file to notify of state change in leases allocations.
+        # This has to exist before the LeaseManager does: its constructor
+        # already reconciles the lease table against the configuration, and a
+        # static reservation that evicts a dynamic lease reports the eviction
+        # through execute_hook right there. Set up afterwards, that first
+        # event died on a missing attribute and never reached the hook, so
+        # whatever the hook publishes kept the evicted binding. The garbage
+        # collector started below can fire the hook just as early.
+        self.hook_file = hook_file
+        self.base_env = os.environ.copy()
+        self.base_env.update({
+            'ISODHCP_PID': str(os.getpid()),
+            'ISODHCP_LEASE_FILE': os.path.abspath(lease_file),
+            'ISODHCP_SERVER_IP': str(self.server_ip),
+            'ISODHCP_POOL_CIDR': str(self.pool_cidr),
+            'ISODHCP_INTERFACE': self.iface,
+            'ISODHCP_DNS': self.dns_server
+        })
+
         # Pass configs to LeaseManager
         self.lease_mgr = LeaseManager(self.pool_cidr, self.server_ip,
                                       self.lease_file, self.lease_time,
@@ -1641,18 +1666,6 @@ class UnnumberedDHCPServer:
         self.gc_thread = threading.Thread(target=self.garbage_collector,
                                           daemon=True)
         self.gc_thread.start()
-
-        # Script file to notify of state change in leases allocations
-        self.hook_file = hook_file
-        self.base_env = os.environ.copy()
-        self.base_env.update({
-            'ISODHCP_PID': str(os.getpid()),
-            'ISODHCP_LEASE_FILE': os.path.abspath(lease_file),
-            'ISODHCP_SERVER_IP': str(self.server_ip),
-            'ISODHCP_POOL_CIDR': str(self.pool_cidr),
-            'ISODHCP_INTERFACE': self.iface,
-            'ISODHCP_DNS': self.dns_server
-        })
 
         # Read-only diagnostics endpoint (single-binary client mode talks here).
         self.socket_path = resolve_socket_path(
