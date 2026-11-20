@@ -662,6 +662,13 @@ class LeaseManager:
         playground's own gateway, network and broadcast) belong to no pool and
         are simply not handed back.'''
         addr = ipaddress.IPv4Address(ip)
+        # Never hand out what the server uses itself, whichever path brought
+        # the address here: its own address, the pool's network and
+        # broadcast, or any address of a live /30 block.
+        if ip not in self.all_possible_ips or any(
+                addr in ipaddress.IPv4Network(d['subnet'])
+                for d in self.subnet_leases.values()):
+            return
         if self.playground_subnet and addr in self.playground_subnet:
             if ip != self.playground_gateway and \
                addr != self.playground_subnet.network_address and \
@@ -956,6 +963,18 @@ class LeaseManager:
             if current_owner and current_owner != mac:
                 logger.warning(f'⚠️ Security: Ignored spoofed DECLINE for {ip} '
                                f'from {mac} (owned by {current_owner})')
+                return
+            # Only a client's own lease, or an address that is free, can be
+            # declined. Anything else is not the client's to decline, and some
+            # of it -- a /30 gateway alias, the server's own address -- would
+            # come back out of quarantine as an ordinary free address, to be
+            # handed to whoever asks next, who would then answer ARP for
+            # another client's gateway.
+            if current_owner != mac and ip not in self.free_ips and \
+               ip not in self.playground_free_ips:
+                logger.warning(f'⚠️ Security: Ignored DECLINE for {ip} from '
+                               f'{mac}, which neither holds it nor could have '
+                               f'been offered it')
                 return
             if current_owner == mac:
                 self.release(mac)
