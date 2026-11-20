@@ -41,7 +41,9 @@ compact for /30 blocks taken from the bottom. The choice is made among the four
 highest free addresses, preferring the one that has been free the longest and
 avoiding any that would break up a whole /30 block, so a just-released address
 is not offered straight back out while an address free for longer is among the
-four. The release history is kept in the lease file.
+four. A client that asks again after its lease ran out, or after releasing it,
+gets its former address -- or its /30 block -- back if that is still
+free. The release history is kept in the lease file.
 
 The server features built-in DoS protection (quarantine), ARP conflict
 detection, and robust integration with **nftables** for high-performance

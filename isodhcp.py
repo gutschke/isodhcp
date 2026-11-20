@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 # Disable promiscuous mode to prevent Avahi flapping on interface changes
 conf.sniff_promisc = 0
 
+MAC_RE = re.compile(r'[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+
+def unicast_mac(m):
+    '''True if `m` is a canonical MAC string naming one station: not a
+    group (broadcast or multicast) address, and not all zeroes.'''
+    return isinstance(m, str) and bool(MAC_RE.fullmatch(m)) and \
+        not int(m[:2], 16) & 1 and m != '00:00:00:00:00:00'
+
 def _finite_time(v):
     '''`v` if it is a plausible epoch timestamp from our own lease file,
     else None. JSON accepts NaN and Infinity, and bool is an int.'''
@@ -448,6 +456,11 @@ class LeaseManager:
         # Persisted, because a restart is exactly when a whole set of leases
         # tends to have lapsed together.
         self.last_freed = {}
+        # Who last held each freed address, and whether its lease ran out
+        # rather than being released. A device that carries on using an
+        # expired lease is the usual silent squatter, and if it does come back
+        # through DHCP it should get the same address again (RFC 2131 4.3.1).
+        self.former = {}  # ip -> {'mac': str, 'expired': bool, 'block': cidr}
         # Bound the quarantine so a device that DECLINE-floods or ARP-claims many pool IPs
         # cannot pin the whole pool out of service. At least half the pool is always kept
         # allocatable; reaching the cap raises a loud one-shot alert.
@@ -776,6 +789,43 @@ class LeaseManager:
         order = self._window_order(pool, 1)
         return order[0] if order else None
 
+    def _former_address(self, mac, pool):
+        '''The address `mac` held most recently, if it is still in `pool`.'''
+        best = None
+        for ip, f in self.former.items():
+            if f['mac'] != mac or f.get('block') or ip not in pool: continue
+            if best is None or self.last_freed.get(ip, 0.0) > \
+                    self.last_freed.get(best, 0.0):
+                best = ip
+        return best
+
+    def _take_former(self, mac, pool):
+        '''Give a returning client the address it held last, if nobody else
+        has it (RFC 2131 4.3.1), and take it out of `pool`. Caller holds the
+        lock.'''
+        ip = self._former_address(mac, pool)
+        if not ip: return None
+        pool.discard(ip)
+        logger.info(f'♻️ Returning {ip} to its former holder {mac}.')
+        return ip
+
+    def _take_former_block(self, mac):
+        '''The compat equivalent of _take_former: the /30 block `mac` held
+        last, if every address of it is still free. Returns (client, gateway,
+        subnet) and claims the block, or None.'''
+        for ip, f in sorted(self.former.items(),
+                            key=lambda kv: -self.last_freed.get(kv[0], 0.0)):
+            if f['mac'] != mac or not f.get('block'): continue
+            block = [str(x) for x in ipaddress.IPv4Network(f['block'])]
+            if not all(x in self.free_ips for x in block):
+                continue
+            for x in block:
+                self.free_ips.discard(x)
+            logger.info(f'♻️ Returning {f["block"]} to its former holder '
+                        f'{mac}.')
+            return block[2], block[1], f['block']
+        return None
+
     def find_free_slash_30(self):
         '''
         Scans the pool for a block of 4 IPs (net, gateway, client, broadcast)
@@ -819,11 +869,18 @@ class LeaseManager:
                     expires = data['expires']
 
                 # A lease that lapsed while we were down went free when it
-                # expired, not when we came back.
+                # expired, not when we came back -- for a compat client, its
+                # whole /30 did, and the block is what it should get back.
                 if expires != float('inf') and expires <= now and \
                    ip in self.all_possible_ips:
-                    self.last_freed[ip] = max(self.last_freed.get(ip, 0.0),
-                                              expires)
+                    block = self._saved_block(
+                        saved_data.get('subnets', {}).get(mac), ip)
+                    for x in block or [ip]:
+                        self.last_freed[x] = max(self.last_freed.get(x, 0.0),
+                                                 expires)
+                    self.former[ip] = {'mac': mac, 'expired': True}
+                    if block:
+                        self.former[ip]['block'] = f'{block[0]}/30'
 
                 # Only load if valid and valid IP
                 if (expires == float('inf') or expires > now) and \
@@ -864,8 +921,29 @@ class LeaseManager:
                 ts = _finite_time(r.get('at'))
                 if ts is None: continue
                 self.last_freed[ip] = max(self.last_freed.get(ip, 0.0), ts)
+                if unicast_mac(r.get('mac')) and ip not in self.former:
+                    self.former[ip] = {'mac': r['mac'],
+                                       'expired': bool(r.get('expired'))}
+                    if r.get('block'):
+                        block = self._saved_block({'subnet': r['block']}, ip)
+                        if block:
+                            self.former[ip]['block'] = f'{block[0]}/30'
         except Exception as e:
             logger.error(f'⚠️ Failed to load lease file: {e}')
+
+    def _saved_block(self, sub, ip):
+        '''The addresses of the /30 that `sub` (a saved subnet record) names,
+        if it is one inside the pool with `ip` as its client address; else
+        None. The file is ours, but a damaged one must not turn into a block
+        of any size.'''
+        try:
+            net = ipaddress.IPv4Network(sub['subnet'])
+        except Exception:
+            return None
+        if net.prefixlen != 30 or not net.subnet_of(self.network):
+            return None
+        block = [str(x) for x in net]
+        return block if block[2] == ip else None
 
     def save_leases(self, force=False):
         '''
@@ -892,7 +970,7 @@ class LeaseManager:
 
     def _released_record(self):
         '''Recent release history for the lease file: when each currently free
-        address was freed. Only
+        address was freed, and by whom. Only
         the most recent RELEASED_MAX within RELEASED_KEEP are kept, so the
         file does not grow with the pool and is not rewritten in full on
         every lease change on a large one.'''
@@ -901,7 +979,17 @@ class LeaseManager:
             self.RELEASED_MAX,
             ((ts, ip) for ip, ts in self.last_freed.items()
              if ts >= cutoff and ip not in self.ip_to_mac))
-        return {ip: {'at': round(ts, 1)} for ts, ip in recent}
+        out = {}
+        for ts, ip in recent:
+            r = {'at': round(ts, 1)}
+            f = self.former.get(ip)
+            if f:
+                r['mac'] = f['mac']
+                r['expired'] = f['expired']
+                if f.get('block'):
+                    r['block'] = f['block']
+            out[ip] = r
+        return out
 
     def enforce_static_bindings(self):
         '''
@@ -955,7 +1043,7 @@ class LeaseManager:
         disk-reloaded) that carry no 'mode' field. See classify_lease_mode.'''
         return classify_lease_mode(mac, data, self.subnet_leases)
 
-    def release(self, mac, force=False):
+    def release(self, mac, force=False, expired=False):
         with self.cv:
             if mac in self.leases:
                 data = self.leases[mac]
@@ -990,8 +1078,10 @@ class LeaseManager:
                     return None
 
                 # Check if it was a compat /30 lease
+                block = None
                 if mac in self.subnet_leases:
                     sub_data = self.subnet_leases.pop(mac, None)
+                    block = sub_data['subnet']
                     subnet_cidr = sub_data['subnet']
                     gw_ip = sub_data['gateway']
 
@@ -1023,6 +1113,12 @@ class LeaseManager:
                     if mac in self.subnet_leases:
                         gw_ip = self.subnet_leases[mac]['gateway']
                     self.sys.update_snat('delete', ip, gw_ip)
+
+                # Remember who held it, so that it gets the same address --
+                # or the same /30 -- back if it asks again.
+                self.former[ip] = {'mac': mac, 'expired': expired}
+                if block:
+                    self.former[ip]['block'] = block
 
                 # Common clean-up
                 self.ip_to_mac.pop(ip, None)
@@ -1109,6 +1205,7 @@ class LeaseManager:
                 return
             if current_owner == mac:
                 self.release(mac)
+                self.former.pop(ip, None)
             if self._quarantine(ip, time.time() + 600):
                 self.free_ips.discard(ip)
                 self.playground_free_ips.discard(ip)
@@ -1275,7 +1372,9 @@ class LeaseManager:
                             logger.error(f'❌ Playground requested by {mac} '
                                          f'but not configured.')
                             return None
-                        target_ip = self._pick_dynamic(self.playground_free_ips)
+                        target_ip = self._take_former(
+                            mac, self.playground_free_ips) or \
+                            self._pick_dynamic(self.playground_free_ips)
                         if target_ip:
                             self.playground_free_ips.discard(target_ip)
                             nft_compat_flag = False
@@ -1284,8 +1383,13 @@ class LeaseManager:
                             return None
                     # Compat /30
                     elif mode == ClientClassifier.MODE_COMPAT:
-                        subnet = self.find_free_slash_30()
-                        if subnet:
+                        former = self._take_former_block(mac)
+                        subnet = None if former else self.find_free_slash_30()
+                        if former:
+                            target_ip, gw, cidr = former
+                            subnet_info = (gw, cidr)
+                            nft_compat_flag = True
+                        elif subnet:
                             block = [str(x) for x in subnet]
                             # block=[net, gw, client, bcast]
                             target_ip = block[2]
@@ -1302,7 +1406,10 @@ class LeaseManager:
                             return None
                     # Dynamically allocate standard IP address (/32)
                     else:
-                        if self.free_ips:
+                        target_ip = self._take_former(mac, self.free_ips)
+                        if target_ip:
+                            nft_compat_flag = False
+                        elif self.free_ips:
                             for _ in range(5):
                                 # Highest first, mostly; see _pick_dynamic.
                                 candidate = self._pick_dynamic(self.free_ips)
@@ -1431,7 +1538,7 @@ class LeaseManager:
 
             # Cleanup
             for mac, ip in expired_entries:
-                self.release(mac)
+                self.release(mac, expired=True)
 
         return expired_entries
 
